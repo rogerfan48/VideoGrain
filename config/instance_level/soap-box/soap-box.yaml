@@ -1,0 +1,45 @@
+pretrained_model_path: "./ckpt/stable-diffusion-v1-5"
+logdir: ./result/instance_level/soap-box/5cls_ironman_push_stormtrooper
+
+dataset_config:
+    path: "data/soap-box/soap-box"
+    prompt: ""
+    start_sample_frame: 12
+    n_sample_frame: 16
+    sampling_rate: 2
+    layout_mask_dir: "./data/soap-box/layout_masks"
+    layout_mask_order: ['man2','man1','bridge','ground-full','bg']
+    negative_promot: "ugly, blurry, low res, unrealistic, unaesthetic"
+
+control_config:
+    control_type: "depth_zoe"
+    pretrained_controlnet_path: "./ckpt/control_v11f1p_sd15_depth"
+    controlnet_conditioning_scale: 1.0
+    hand: False
+    face: False
+
+editing_config:
+    use_invertion_latents: true
+    inject_step: 5
+    old_qk: 1
+    flatten_res: [1]
+    guidance_scale: 7.5
+    use_pnp: true
+    use_freeu: false
+    editing_prompts: [
+        ['An Iron Man and a Stormtrooper on moss covered stone bridge over lake in the forest','An Iron Man','a Stormtrooper','moss covered stone bridge','lake','forest'],
+    ]
+    clip_length: "${..dataset_config.n_sample_frame}"
+    sample_seeds: [0]
+    num_inference_steps: 50
+    blending_percentage: 0
+    
+
+test_pipeline_config:
+    target: video_diffusion.pipelines.ddim_spatial_temporal.DDIMSpatioTemporalStableDiffusionPipeline
+    num_inference_steps: "${..validation_sample_logger.num_inference_steps}"
+
+
+
+seed: 42
+

@@ -1,0 +1,7 @@
+annotator/ckpts/**
+annotator/annotator_ckpts.tar.gz
+result/**
+trash/**
+data/** 
+videograin_data.tar.gz
+__pycache__

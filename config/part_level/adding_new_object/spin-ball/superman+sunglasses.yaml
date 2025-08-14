@@ -1,0 +1,45 @@
+pretrained_model_path: "./ckpt/stable-diffusion-v1-5"
+
+logdir: "./result/part_level/adding_new_object/spin_ball/superman+sunglasses"   
+
+dataset_config:
+    path: "data/spin-ball/spin-ball"
+    prompt: "a man is spining a basketball"
+    n_sample_frame: 12
+    sampling_rate: 1
+    layout_mask_dir: "data/spin-ball/layout_masks"
+    layout_mask_order: ['man_wo_eyes','eyes','ball','trees']
+    negative_promot: "jittery, ugly, blurry, low res, unrealistic, unaesthetic"
+
+control_config:
+   control_type: "depth_zoe"
+   pretrained_controlnet_path:  "./ckpt/control_v11f1p_sd15_depth"
+   controlnet_conditioning_scale: 1.0
+ 
+editing_config:
+    use_invertion_latents: true
+    inject_step: 0
+    old_qk: 1
+    flatten_res: [1]
+    guidance_scale: 7.5
+    use_pnp: false
+    use_freeu: false
+
+    editing_prompts: [
+        ['Superman in sunglasses spins moon under cherry blossoms','Superman','sunglasses','moon','cherry blossoms'],
+    ]
+
+    clip_length: "${..dataset_config.n_sample_frame}"
+    sample_seeds: [0]
+    num_inference_steps: 50
+    blending_percentage: 0
+    
+
+test_pipeline_config:
+    target: video_diffusion.pipelines.ddim_spatial_temporal.DDIMSpatioTemporalStableDiffusionPipeline
+    num_inference_steps: "${..validation_sample_logger.num_inference_steps}"
+
+
+
+seed: 42
+

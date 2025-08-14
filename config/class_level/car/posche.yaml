@@ -1,0 +1,52 @@
+pretrained_model_path: "./ckpt/stable-diffusion-v1-5"
+logdir: ./result/class_level/car/car_to_posche
+
+dataset_config:
+    path: "data/car/car"   #"data/general_object/car_turn/car_turn_start_20"
+    prompt: A car 
+    start_sample_frame: 0
+    n_sample_frame: 12
+    sampling_rate: 1
+    layout_mask_dir: "data/car/layout_masks"
+    layout_mask_order: ['car','bg'] 
+    negative_promot: "jittery"
+
+
+control_config:
+    control_type: "depth_zoe"
+    pretrained_controlnet_path: "./ckpt/sd-controlnet-depth"
+    controlnet_conditioning_scale: 1.0
+
+
+editing_config:
+    # ddim_inversion_steps: 100
+    use_invertion_latents: true
+    inject_step: 10
+    old_qk: 1
+    flatten_res: [1]
+    guidance_scale: 7.5
+    use_pnp: true
+    use_freeu: false
+    editing_prompts: [     
+            ['A red porsche car driving before the autumn view lawn','A red porsche car','autumn view lawn'],
+    ]
+    clip_length: "${..dataset_config.n_sample_frame}"
+    sample_seeds: [0]
+    num_inference_steps: 50
+    blending_percentage: 0
+    modulated_percentage: 0.3
+    
+model_config:
+    # lora: 160
+    # temporal_downsample_time: 4
+    # SparseCausalAttention_index: ['first'] 
+    # least_sc_channel: 640
+    # least_sc_channel: 100000
+
+test_pipeline_config:
+    target: video_diffusion.pipelines.ddim_spatial_temporal.DDIMSpatioTemporalStableDiffusionPipeline
+    num_inference_steps: "${..validation_sample_logger.num_inference_steps}"
+
+
+
+seed: 42

@@ -1,0 +1,44 @@
+pretrained_model_path: "./ckpt/stable-diffusion-v1-5"
+logdir: ./result/instance_level/2_cars/left_firetruck_right_school-bus_preserve_bg
+
+dataset_config:
+    path: "data/2_cars/2_cars"   #"data/general_object/car_turn/car_turn_start_20"
+    prompt: two cars are on the highway
+    start_sample_frame: 0
+    n_sample_frame: 14
+    sampling_rate: 1
+    layout_mask_dir: "data/2_cars/layout_masks"
+    layout_mask_order: ['left_box','right_box'] 
+    negative_promot: 'jittery'
+
+control_config:
+    control_type: "depth_zoe"
+    pretrained_controlnet_path: ./ckpt/control_v11f1p_sd15_depth
+    controlnet_conditioning_scale: 0.7
+
+
+editing_config:
+    use_invertion_latents: true
+    inject_step: 30
+    old_qk: 1
+    flatten_res: [1]
+    guidance_scale: 7.5
+    use_pnp: true
+    use_freeu: false
+    editing_prompts: [     
+            ['A firetruck and a school bus are on the road', 'A firetruck','a school bus'],
+    ]
+    clip_length: "${..dataset_config.n_sample_frame}"
+    sample_seeds: [0]
+    num_inference_steps: 50
+    blending_percentage: 0
+    modulated_percentage: 0.3
+    
+
+test_pipeline_config:
+    target: video_diffusion.pipelines.ddim_spatial_temporal.DDIMSpatioTemporalStableDiffusionPipeline
+    num_inference_steps: "${..validation_sample_logger.num_inference_steps}"
+
+
+
+seed: 42

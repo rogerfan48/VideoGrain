@@ -1,0 +1,43 @@
+pretrained_model_path: "./ckpt/stable-diffusion-v1-5"
+logdir: ./result/part_level/adding_new_object/boxer-punching/4cls_thor_add_sunglasses_red_gloves_night
+
+dataset_config:
+    path: "data/boxer-punching/boxer-punching"
+    prompt: A boxer wearing black boxing gloves punches towards the camera 
+    start_sample_frame: 4
+    n_sample_frame: 28
+    sampling_rate: 1
+    layout_mask_dir: "data/boxer-punching/layout_masks"
+    layout_mask_order: ['man_wo_eyes','eyes','gloves','bg']
+    negative_promot: "jittery, ugly, blurry, low res, unrealistic, unaesthetic"
+
+control_config:
+   control_type: "depth"
+   pretrained_controlnet_path: "./ckpt/control_v11f1p_sd15_depth"
+   controlnet_conditioning_scale: 1.0
+
+
+editing_config:
+    use_invertion_latents: true
+    inject_step: 10
+    old_qk: 1
+    flatten_res: [1,2,4]
+    guidance_scale: 7.5
+    use_pnp: true
+    use_freeu: true
+
+    editing_prompts: [
+        ['Thor in sunglasses, punching red boxing gloves in starry night sky','Thor','sunglasses','red boxing gloves','starry night sky'],
+    ]
+
+    clip_length: "${..dataset_config.n_sample_frame}"
+    sample_seeds: [0]
+    num_inference_steps: 50
+    blending_percentage: 0
+    
+test_pipeline_config:
+    target: video_diffusion.pipelines.ddim_spatial_temporal.DDIMSpatioTemporalStableDiffusionPipeline
+    num_inference_steps: "${..validation_sample_logger.num_inference_steps}"
+
+seed: 42
+

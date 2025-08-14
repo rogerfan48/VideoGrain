@@ -1,0 +1,45 @@
+pretrained_model_path: "./ckpt/stable-diffusion-v1-5"
+logdir: ./result/class_level/tennis/3cls_man_to_batman_snow-court_iced-wall
+ 
+dataset_config:
+    path:  "data/tennis/tennis"
+    prompt: a man is on a clay court before a stone wall.
+    n_sample_frame: 24
+    sampling_rate: 2
+    layout_mask_dir: "./data/tennis/layout_masks"
+    layout_mask_order: ["man","court",'stone_wall']
+    negative_promot: "jittery, ugly, blurry, low res, unrealistic, unaesthetic"
+
+
+# use_invertion_latents: True
+control_config:
+    control_type: "openpose"
+    pretrained_controlnet_path: ./ckpt/sd-controlnet-openpose 
+    controlnet_conditioning_scale: 1.0
+    hand: False
+    face: False
+
+editing_config:
+    use_invertion_latents: true
+    inject_step: 0
+    old_qk: 1
+    flatten_res: [1]
+    guidance_scale: 7.5
+    use_pnp: false
+    use_freeu: false
+    editing_prompts: [     
+            ['A Batman is on snow covered court before an iced wall','A Batman','snow covered court','an iced wall'],
+    ]
+    clip_length: "${..dataset_config.n_sample_frame}"
+    sample_seeds: [0]
+    num_inference_steps: 50
+    blending_percentage: 0
+    modulated_percentage: 0.3
+    
+test_pipeline_config:
+    target: video_diffusion.pipelines.ddim_spatial_temporal.DDIMSpatioTemporalStableDiffusionPipeline
+    num_inference_steps: "${..validation_sample_logger.num_inference_steps}"
+
+
+
+seed: 42

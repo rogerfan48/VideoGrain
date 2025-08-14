@@ -1,0 +1,44 @@
+pretrained_model_path: "./ckpt/stable-diffusion-v1-5"
+logdir: ./result/instance_level/2_monkeys/left_teddy_right_golden_retriever
+
+dataset_config:
+    path: "data/2_monkeys/2_monkeys" 
+    prompt: two monkeys are eating food
+    start_sample_frame: 14
+    n_sample_frame: 16
+    sampling_rate: 1
+    layout_mask_dir: "data/2_monkeys/layout_masks"
+    layout_mask_order: ['left','right','bg'] 
+    negative_promot: "ugly, blurry, low res, unrealistic, unaesthetic"
+
+
+control_config:
+    control_type: "depth_zoe"
+    pretrained_controlnet_path: ./ckpt/control_v11f1p_sd15_depth
+    controlnet_conditioning_scale: 0.8
+
+
+editing_config:
+    use_invertion_latents: true
+    inject_step: 10
+    old_qk: 1
+    flatten_res: [1]
+    guidance_scale: 7.5
+    use_pnp: true
+    use_freeu: false
+    editing_prompts: [     
+        ['A teddy bear and a Golden Retriever are on the grassy area with dry leaves','A teddy bear','a Golden Retriever','grassy area with dry leaves'], ##note: test on frames 14-30
+    ]
+    clip_length: "${..dataset_config.n_sample_frame}"
+    sample_seeds: [0]
+    num_inference_steps: 50
+    blending_percentage: 0
+    modulated_percentage: 0.3
+    
+test_pipeline_config:
+    target: video_diffusion.pipelines.ddim_spatial_temporal.DDIMSpatioTemporalStableDiffusionPipeline
+    num_inference_steps: "${..validation_sample_logger.num_inference_steps}"
+
+
+
+seed: 42

@@ -1,0 +1,43 @@
+pretrained_model_path: "./ckpt/stable-diffusion-v1-5"
+logdir: ./result/instance_level/2_cats/4cls_panda_vs_toy_poddle_on_meadow_in_starry_night
+
+dataset_config:
+    path: "data/2_cats/2_cats"  
+    prompt: ""
+    start_sample_frame: 0
+    n_sample_frame: 24
+    sampling_rate: 1
+    layout_mask_dir: "data/2_cats/layout_masks"
+    layout_mask_order: ['left','right','bg','ground'] 
+    negative_promot: "a cat with big ear are playing with another cat, deformed"
+
+control_config:
+    control_type: "depth"
+    pretrained_controlnet_path: "./ckpt/sd-controlnet-depth"
+    controlnet_conditioning_scale: 0.53
+
+editing_config:
+    use_invertion_latents: true
+    inject_step: 0
+    old_qk: 1
+    flatten_res: [1,2,4]
+    guidance_scale: 7.5
+    use_pnp: false
+    use_freeu: false
+    editing_prompts: [     
+            ['A Giant Panda and a curly apricot fur toy poodle are in starry night on grassy meadow','A Giant Panda','a curly apricot fur toy poodle','starry night','grassy meadow'], 
+    ]
+    clip_length: "${..dataset_config.n_sample_frame}"
+    sample_seeds: [0]
+    num_inference_steps: 50
+    blending_percentage: 0
+    modulated_percentage: 0.3
+    
+
+test_pipeline_config:
+    target: video_diffusion.pipelines.ddim_spatial_temporal.DDIMSpatioTemporalStableDiffusionPipeline
+    num_inference_steps: "${..validation_sample_logger.num_inference_steps}"
+
+
+
+seed: 42

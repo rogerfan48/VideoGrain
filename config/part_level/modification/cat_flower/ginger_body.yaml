@@ -1,0 +1,44 @@
+pretrained_model_path: "./ckpt/stable-diffusion-v1-5"
+logdir: ./result/part_level/part_level_modification/cat_flower/ginger_body
+
+dataset_config:
+    path: "data/cat_flower/cat_flower"
+    prompt: A cat is roaring
+    n_sample_frame: 8
+    sampling_rate: 1
+    layout_mask_dir: "data/cat_flower/layout_masks"
+    layout_mask_order: ["body_wo_belt",'body_bg']
+    negative_promot: "ugly, blurry, low res, unrealistic, unaesthetic"
+
+
+control_config:
+    control_type: "depth_zoe"
+    pretrained_controlnet_path: "./ckpt/sd-controlnet-depth"
+    controlnet_conditioning_scale: 1.0
+
+
+editing_config:
+    use_invertion_latents: true
+    inject_step: 40
+    old_qk: 1
+    flatten_res: [1]
+    guidance_scale: 7.5
+    use_pnp: true
+    use_freeu: false
+    editing_prompts: [    
+            ['A ginger cat body is roaring','ginger cat body'], 
+    ]
+    clip_length: "${..dataset_config.n_sample_frame}"
+    sample_seeds: [0]
+    num_inference_steps: 50
+    blending_percentage: 0
+    modulated_percentage: 0.3
+    
+
+test_pipeline_config:
+    target: video_diffusion.pipelines.ddim_spatial_temporal.DDIMSpatioTemporalStableDiffusionPipeline
+    num_inference_steps: "${..validation_sample_logger.num_inference_steps}"
+
+
+
+seed: 42

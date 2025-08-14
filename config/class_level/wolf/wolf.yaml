@@ -1,0 +1,47 @@
+pretrained_model_path: "./ckpt/stable-diffusion-v1-5"
+logdir: ./result/class_level/wolf2pig_preserve_bg
+
+dataset_config:
+    path: "data/wolf/wolf"  
+    prompt: A wolf
+    start_sample_frame: 0
+    n_sample_frame: 16
+    sampling_rate: 2
+    layout_mask_dir: "data/wolf/layout_masks/"
+    layout_mask_order: ['wolf','bg'] 
+    negative_promot: "a wolf, deformed"
+
+control_config:
+    control_type: "depth_zoe"
+    pretrained_controlnet_path: "./ckpt/sd-controlnet-depth"
+    controlnet_conditioning_scale: 0.7
+
+
+editing_config:
+    use_invertion_latents: true
+    inject_step: 0
+    old_qk: 1
+    flatten_res: [1,2,4]
+    guidance_scale: 7.5
+    use_pnp: false
+    use_freeu: false
+    editing_prompts: [     
+            ['A cute pig in the autum forest','A cute pig','autum forest'],
+            ['A husky in the green forest','A husky','green forest'],
+            ['A tiger in the autum forest','A tiger','autum forest'],
+            ['A bear in the autum  forest','A bear','autum forest'], 
+
+    ]
+    clip_length: "${..dataset_config.n_sample_frame}"
+    sample_seeds: [0]
+    num_inference_steps: 50
+    blending_percentage: 0
+    modulated_percentage: 0.3
+
+test_pipeline_config:
+    target: video_diffusion.pipelines.ddim_spatial_temporal.DDIMSpatioTemporalStableDiffusionPipeline
+    num_inference_steps: "${..validation_sample_logger.num_inference_steps}"
+
+
+
+seed: 42
