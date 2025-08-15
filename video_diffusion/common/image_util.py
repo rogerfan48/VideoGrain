@@ -15,10 +15,48 @@ from einops import rearrange
 import torchvision
 import imageio
 
-import torchvision.transforms.functional as F
+import torchvision.transforms.functional as TF
 import random
 from scipy.ndimage import binary_dilation
 import sys
+import torch
+import torch.nn.functional as F
+
+# 修復 cuDNN 兼容性問題的輔助函數
+def safe_grid_sample(input, grid, mode='bilinear', padding_mode='zeros', align_corners=None):
+    """安全的 grid_sample 操作，處理 cuDNN 兼容性問題"""
+    try:
+        # 確保輸入是連續的
+        input = input.contiguous()
+        grid = grid.contiguous()
+        
+        # 嘗試使用 cuDNN
+        return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+    except RuntimeError as e:
+        if "cuDNN error" in str(e):
+            print(f"cuDNN 錯誤，嘗試不使用 cuDNN: {e}")
+            # 禁用 cuDNN 並重試
+            with torch.backends.cudnn.flags(enabled=False):
+                return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+        else:
+            raise e
+
+def safe_model_forward(model, *args, **kwargs):
+    """安全的模型前向傳播，處理 cuDNN 兼容性問題"""
+    try:
+        # 確保所有輸入都是連續的
+        args = tuple(arg.contiguous() if isinstance(arg, torch.Tensor) else arg for arg in args)
+        return model(*args, **kwargs)
+    except RuntimeError as e:
+        if "cuDNN error" in str(e):
+            print(f"模型前向傳播 cuDNN 錯誤，嘗試不使用 cuDNN: {e}")
+            # 禁用 cuDNN 並重試
+            with torch.backends.cudnn.flags(enabled=False):
+                return model(*args, **kwargs)
+        else:
+            raise e
+
+
 
 IMAGE_EXTENSION = (".jpg", ".jpeg", ".png", ".ppm", ".bmp", ".pgm", ".tif", ".tiff", ".webp", ".JPEG")
 
@@ -382,8 +420,8 @@ def visualize_check_downsample_keypoints(images, keypoint_data, target_res=(32, 
 
 """optical flow and trajectories sampling"""
 def preprocess(img1_batch, img2_batch, transforms, height,width):
-    img1_batch = F.resize(img1_batch, size=[height, width], antialias=False)
-    img2_batch = F.resize(img2_batch, size=[height, width], antialias=False)
+    img1_batch = TF.resize(img1_batch, size=[height, width], antialias=False)
+    img2_batch = TF.resize(img2_batch, size=[height, width], antialias=False)
     return transforms(img1_batch, img2_batch)
 
 def keys_with_same_value(dictionary):
@@ -445,7 +483,7 @@ def sample_trajectories(video_path, device,height,width):
     finished_trajectories = []
 
     current_frames, next_frames = preprocess(frames[clips[:-1]], frames[clips[1:]], transforms, 512,512)
-    list_of_flows = model(current_frames.to(device), next_frames.to(device))
+    list_of_flows = safe_model_forward(model, current_frames.to(device), next_frames.to(device))
     predicted_flows = list_of_flows[-1]
     print('predicted_flows',predicted_flows.shape)
     predicted_flows = predicted_flows/512
@@ -581,7 +619,8 @@ def sample_trajectories_new(video_path, device,height,width):
     finished_trajectories = []
 
     current_frames, next_frames = preprocess(frames[clips[:-1]], frames[clips[1:]], transforms, height,width)
-    list_of_flows = model(current_frames.to(device), next_frames.to(device))
+    with torch.autocast(device_type='cuda', dtype=torch.float32):
+        list_of_flows = model(current_frames.to(device), next_frames.to(device))
     predicted_flows = list_of_flows[-1]
     #=============== raft-large estimate forward optical flow============#
 

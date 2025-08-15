@@ -150,35 +150,36 @@ class SampleLogger:
             for seed in self.sample_seeds:
                 generator = torch.Generator(device=device)
                 generator.manual_seed(seed)
-                sequence_return = pipeline(
-                    prompt=prompt,
-                    image=image, # torch.Size([8, 3, 512, 512])
-                    latent_mask=masks,
-                    layouts = layouts,
-                    strength=self.strength,
-                    generator=generator,
-                    num_inference_steps=self.num_inference_steps,
-                    clip_length=self.clip_length,
-                    guidance_scale=self.guidance_scale,
-                    num_images_per_prompt=1,
-                    # used in null inversion
-                    control = control,
-                    controlnet_conditioning_scale = controlnet_conditioning_scale,
-                    latents = latents,
-                    #uncond_embeddings_list = uncond_embeddings_list,
-                    blending_percentage =  blending_percentage,
-                    logdir = self.logdir,
-                    trajs = trajs,
-                    flatten_res = flatten_res,
-                    negative_prompt=negative_prompt,
-                    source_prompt=source_prompt,
-                    inject_step=inject_step,
-                    old_qk=old_qk,
-                    use_pnp=use_pnp,
-                    cluster_inversion_feature= cluster_inversion_feature,
-                    vis_cross_attn = vis_cross_attn,
-                    attn_inversion_dict=attn_inversion_dict,
-                )
+                with torch.autocast(device_type='cuda', dtype=torch.float32):
+                    sequence_return = pipeline(
+                        prompt=prompt,
+                        image=image, # torch.Size([8, 3, 512, 512])
+                        latent_mask=masks,
+                        layouts = layouts,
+                        strength=self.strength,
+                        generator=generator,
+                        num_inference_steps=self.num_inference_steps,
+                        clip_length=self.clip_length,
+                        guidance_scale=self.guidance_scale,
+                        num_images_per_prompt=1,
+                        # used in null inversion
+                        control = control,
+                        controlnet_conditioning_scale = controlnet_conditioning_scale,
+                        latents = latents,
+                        #uncond_embeddings_list = uncond_embeddings_list,
+                        blending_percentage =  blending_percentage,
+                        logdir = self.logdir,
+                        trajs = trajs,
+                        flatten_res = flatten_res,
+                        negative_prompt=negative_prompt,
+                        source_prompt=source_prompt,
+                        inject_step=inject_step,
+                        old_qk=old_qk,
+                        use_pnp=use_pnp,
+                        cluster_inversion_feature= cluster_inversion_feature,
+                        vis_cross_attn = vis_cross_attn,
+                        attn_inversion_dict=attn_inversion_dict,
+                    )
 
                 sequence = sequence_return.images[0]
                 torch.cuda.empty_cache()

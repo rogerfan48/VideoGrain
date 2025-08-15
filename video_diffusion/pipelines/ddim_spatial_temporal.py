@@ -199,20 +199,22 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
                 latent_model_input = self.inverse_scheduler.scale_model_input(latent_model_input, t)
 
 
-                down_block_res_samples, mid_block_res_sample = self.controlnet(latent_model_input, t, encoder_hidden_states=prompt_embeds,controlnet_cond=control,return_dict=False)
+                with torch.autocast(device_type='cuda', dtype=torch.float32):
+                    down_block_res_samples, mid_block_res_sample = self.controlnet(latent_model_input, t, encoder_hidden_states=prompt_embeds,controlnet_cond=control,return_dict=False)
                 down_block_res_samples = [
                     down_block_res_sample * controlnet_conditioning_scale
                     for down_block_res_sample in down_block_res_samples
                 ]
                 mid_block_res_sample *= controlnet_conditioning_scale
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    down_block_additional_residuals=down_block_res_samples,
-                    mid_block_additional_residual=mid_block_res_sample,
-                    **kwargs,
-                ).sample 
+                with torch.autocast(device_type='cuda', dtype=torch.float32):
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
+                        **kwargs,
+                    ).sample 
                 if use_pnp and t.cpu() in timesteps:
                     saved_features0.append(self.unet.up_blocks[1].resnets[0].out_layers_features.cpu())
                     saved_features1.append(self.unet.up_blocks[1].resnets[1].out_layers_features.cpu())
@@ -767,27 +769,29 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
                     else:
                         self.clean_features()
 
-                    down_block_res_samples, mid_block_res_sample = self.controlnet(
-                        latent_model_input,
-                        t,
-                        encoder_hidden_states=text_embeddings,
-                        controlnet_cond=control,
-                        return_dict=False,
-                    )
+                    with torch.autocast(device_type='cuda', dtype=torch.float32):
+                        down_block_res_samples, mid_block_res_sample = self.controlnet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=text_embeddings,
+                            controlnet_cond=control,
+                            return_dict=False,
+                        )
                     down_block_res_samples = [
                         down_block_res_sample * controlnet_conditioning_scale
-                        for down_block_res_sample in down_block_res_samples
+                        for down_block_res_sample in down_block_res_samples 
                     ]
                     mid_block_res_sample *= controlnet_conditioning_scale
                     
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        t,
-                        encoder_hidden_states=text_embeddings,
-                        down_block_additional_residuals=down_block_res_samples,
-                        mid_block_additional_residual=mid_block_res_sample,
-                        **kwargs,
-                    ).sample.to(dtype=weight_dtype)
+                    with torch.autocast(device_type='cuda', dtype=torch.float32):
+                        noise_pred = self.unet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=text_embeddings,
+                            down_block_additional_residuals=down_block_res_samples,
+                            mid_block_additional_residual=mid_block_res_sample,
+                            **kwargs,
+                        ).sample.to(dtype=weight_dtype)
 
 
                     # perform guidance

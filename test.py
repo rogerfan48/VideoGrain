@@ -87,6 +87,22 @@ def test(
         OmegaConf.save(args, os.path.join(logdir, "config.yml"))
     logger = get_logger_config_path(logdir)
 
+    # ==================== CORRECTED DEBUGGING BLOCK ====================
+
+    # This simple print statement will be executed by all 8 processes.
+    # It uses core accelerate attributes that are guaranteed to exist.
+    print(f"--> Hello from process with RANK: {accelerator.process_index}, using DEVICE: {accelerator.device}")
+
+    # This barrier synchronizes all processes.
+    # It ensures we see all 8 "Hello" messages before the main code continues.
+    accelerator.wait_for_everyone()
+
+    # Let the main process print a final confirmation message.
+    if accelerator.is_main_process:
+        print("\n--- All processes checked in. The multi-GPU setup is WORKING. ---\n")
+
+    # ===================================================================
+
     if seed is not None:
         set_seed(seed)
 
@@ -179,8 +195,11 @@ def test(
     train_sample_save_path = os.path.join(logdir, "infer_samples")
     log_infer_samples(save_path=train_sample_save_path, infer_dataloader=train_dataloader)
 
-    unet, controlnet, train_dataloader  = accelerator.prepare(
-        unet, controlnet, train_dataloader)
+    train_dataloader = accelerator.prepare(train_dataloader)
+
+    unet = unet.to(accelerator.device)
+    if controlnet is not None:
+        controlnet.to(accelerator.device)
     
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
