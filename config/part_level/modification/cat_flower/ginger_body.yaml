@@ -8,7 +8,7 @@ dataset_config:
     sampling_rate: 1
     layout_mask_dir: "data/cat_flower/layout_masks"
     layout_mask_order: ["body_wo_belt",'body_bg']
-    negative_promot: "ugly, blurry, low res, unrealistic, unaesthetic"
+    negative_prompt: "ugly, blurry, low res, unrealistic, unaesthetic"
 
 
 control_config:

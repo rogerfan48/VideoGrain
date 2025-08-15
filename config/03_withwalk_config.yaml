@@ -9,7 +9,7 @@ dataset_config:
   sampling_rate: 3
   layout_mask_dir: "./data/03_withwalk/layout_masks"
   layout_mask_order: ["moving_person", "standing_person"]
-  negative_promot: "ugly, blurry, low res, unrealistic, unaesthetic"
+  negative_prompt: "ugly, blurry, low res, unrealistic, unaesthetic"
 
 control_config:
   control_type: "dwpose"

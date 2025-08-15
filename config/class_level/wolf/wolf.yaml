@@ -9,7 +9,7 @@ dataset_config:
     sampling_rate: 2
     layout_mask_dir: "data/wolf/layout_masks/"
     layout_mask_order: ['wolf','bg'] 
-    negative_promot: "a wolf, deformed"
+    negative_prompt: "a wolf, deformed"
 
 control_config:
     control_type: "depth_zoe"

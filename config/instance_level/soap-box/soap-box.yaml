@@ -9,7 +9,7 @@ dataset_config:
     sampling_rate: 2
     layout_mask_dir: "./data/soap-box/layout_masks"
     layout_mask_order: ['man2','man1','bridge','ground-full','bg']
-    negative_promot: "ugly, blurry, low res, unrealistic, unaesthetic"
+    negative_prompt: "ugly, blurry, low res, unrealistic, unaesthetic"
 
 control_config:
     control_type: "depth_zoe"

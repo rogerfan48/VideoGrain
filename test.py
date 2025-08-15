@@ -369,7 +369,7 @@ def test(
                 blending_percentage = editing_config["blending_percentage"],
                 trajs=trajectories,
                 flatten_res = editing_config['flatten_res'],
-                negative_prompt=[dataset_config['negative_promot']],
+                negative_prompt=[dataset_config['negative_prompt']],
                 source_prompt=dataset_config.prompt,
                 inject_step=editing_config["inject_step"],
                 old_qk=editing_config["old_qk"],

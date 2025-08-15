@@ -9,7 +9,7 @@ dataset_config:
   sampling_rate: 2
   layout_mask_dir: "./data/run_two_man/layout_masks_fr2"
   layout_mask_order: ['left_man_plus','right_man_plus','trees','trunk']
-  negative_promot: "ugly, blurry, low res, unrealistic, unaesthetic"
+  negative_prompt: "ugly, blurry, low res, unrealistic, unaesthetic"
 
 control_config:
   control_type: "dwpose"

@@ -9,7 +9,7 @@ dataset_config:
     sampling_rate: 1
     layout_mask_dir: "data/2_monkeys/layout_masks"
     layout_mask_order: ['left','right','bg'] 
-    negative_promot: "ugly, blurry, low res, unrealistic, unaesthetic"
+    negative_prompt: "ugly, blurry, low res, unrealistic, unaesthetic"
 
 
 control_config:

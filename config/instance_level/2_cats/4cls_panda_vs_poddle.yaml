@@ -9,7 +9,7 @@ dataset_config:
     sampling_rate: 1
     layout_mask_dir: "data/2_cats/layout_masks"
     layout_mask_order: ['left','right','bg','ground'] 
-    negative_promot: "a cat with big ear are playing with another cat, deformed"
+    negative_prompt: "a cat with big ear are playing with another cat, deformed"
 
 control_config:
     control_type: "depth"

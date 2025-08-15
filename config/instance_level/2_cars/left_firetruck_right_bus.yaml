@@ -9,7 +9,7 @@ dataset_config:
     sampling_rate: 1
     layout_mask_dir: "data/2_cars/layout_masks"
     layout_mask_order: ['left_car','right_car','road'] 
-    negative_promot: 'jittery'
+    negative_prompt: 'jittery'
 
 control_config:
     control_type: "depth_zoe"

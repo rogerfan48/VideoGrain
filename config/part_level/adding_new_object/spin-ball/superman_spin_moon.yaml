@@ -8,7 +8,7 @@ dataset_config:
     sampling_rate: 1
     layout_mask_dir: "data/spin-ball/layout_masks"
     layout_mask_order: ['man','ball','trees']
-    negative_promot: "jittery, ugly, blurry, low res, unrealistic, unaesthetic"
+    negative_prompt: "jittery, ugly, blurry, low res, unrealistic, unaesthetic"
 
 control_config:
    control_type: "depth_zoe"

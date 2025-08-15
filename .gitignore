@@ -2,7 +2,8 @@ annotator/ckpts/**
 annotator/annotator_ckpts.tar.gz
 result/**
 trash/**
-data/** 
+data/**
+logs/** 
 ckpt/*
 !ckpt/download.sh
 videograin_data.tar.gz

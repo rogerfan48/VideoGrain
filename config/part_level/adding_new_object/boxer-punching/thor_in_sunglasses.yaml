@@ -9,7 +9,7 @@ dataset_config:
     sampling_rate: 1
     layout_mask_dir: "data/boxer-punching/layout_masks"
     layout_mask_order: ['man_wo_eyes','eyes','gloves','bg']
-    negative_promot: "jittery, ugly, blurry, low res, unrealistic, unaesthetic"
+    negative_prompt: "jittery, ugly, blurry, low res, unrealistic, unaesthetic"
 
 control_config:
    control_type: "depth"

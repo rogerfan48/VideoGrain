@@ -9,7 +9,7 @@ dataset_config:
     sampling_rate: 1
     layout_mask_dir: "data/man_text_message/layout_masks"
     layout_mask_order: ['shirt']
-    negative_promot: "jittery, ugly, blurry, low res, unrealistic, unaesthetic"
+    negative_prompt: "jittery, ugly, blurry, low res, unrealistic, unaesthetic"
     
 control_config:
    control_type: "dwpose"

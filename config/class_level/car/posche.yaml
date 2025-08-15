@@ -9,7 +9,7 @@ dataset_config:
     sampling_rate: 1
     layout_mask_dir: "data/car/layout_masks"
     layout_mask_order: ['car','bg'] 
-    negative_promot: "jittery"
+    negative_prompt: "jittery"
 
 
 control_config:
