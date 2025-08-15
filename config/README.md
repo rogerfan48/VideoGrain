@@ -1,0 +1,6 @@
+- `flatten_res`: the resolution levels at which features (e.g., from DDIM inversion or attention maps) are flattened or downsampled during processing
+    - `1` typically maps to a higher resolution (e.g., 64x64 effective grid)
+    - `2` maps to a coarser resolution (e.g., 16x16), which is useful for broader, instance- or class-level edits
+- `use_freeu`: for feature decoupling
+- `inject_step`: when to apply modulation during denoising steps
+- `old_qk`: query-key handling in attention

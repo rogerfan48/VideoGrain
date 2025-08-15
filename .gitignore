@@ -3,5 +3,7 @@ annotator/annotator_ckpts.tar.gz
 result/**
 trash/**
 data/** 
+ckpt/*
+!ckpt/download.sh
 videograin_data.tar.gz
 __pycache__
