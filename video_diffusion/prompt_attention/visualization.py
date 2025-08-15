@@ -74,42 +74,7 @@ def show_cross_attention(tokenizer, prompts, attention_store: AttentionStore,
         save_gif_mp4_folder_type(attention_list, video_save_path)
     return attention_list
 
-def tensor_to_pil(image_tensor):
-    # 首先确保tensor在CPU上
-    image_tensor = image_tensor.cpu()
-    # 将C,H,W转换为H,W,C
-    image_tensor = image_tensor.permute(1, 2, 0)
-    # 正规化到[0,1]
-    image_tensor = (image_tensor - image_tensor.min()) / (image_tensor.max() - image_tensor.min())
-    # 转换为255范围的uint8
-    image_array = np.uint8(255 * image_tensor)
-    # 创建PIL图像
-    image_pil = Image.fromarray(image_array)
-    return image_pil
 
-def show_image_relevance(image_relevance, image: Image.Image, relevnace_res=16):
-    # create heatmap from mask on image
-    def show_cam_on_image(img, mask):
-        heatmap = cv2.applyColorMap(np.uint8(255 * mask), cv2.COLORMAP_JET)
-        heatmap = np.float32(heatmap) / 255
-        cam = heatmap + np.float32(img)
-        cam = cam / np.max(cam)
-        return cam
-    image = tensor_to_pil(image)
-    image = image.resize((relevnace_res ** 2, relevnace_res ** 2))
-    image = np.array(image)
-
-    image_relevance = image_relevance.reshape(1, 1, image_relevance.shape[-1], image_relevance.shape[-1])
-    image_relevance = image_relevance.cuda() # because float16 precision interpolation is not supported on cpu
-    image_relevance = torch.nn.functional.interpolate(image_relevance, size=relevnace_res ** 2, mode='bilinear')
-    image_relevance = image_relevance.cpu() # send it back to cpu
-    image_relevance = (image_relevance - image_relevance.min()) / (image_relevance.max() - image_relevance.min())
-    image_relevance = image_relevance.reshape(relevnace_res ** 2, relevnace_res ** 2)
-    image = (image - image.min()) / (image.max() - image.min()+1e-8)
-    vis = show_cam_on_image(image, image_relevance)
-    vis = np.uint8(255 * vis)
-    vis = cv2.cvtColor(np.array(vis), cv2.COLOR_RGB2BGR)
-    return vis
 
 
 
