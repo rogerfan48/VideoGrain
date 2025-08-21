@@ -1,6 +1,6 @@
 import os
 import numpy as  np
-from typing import List, Union
+from typing import List, Union, Optional
 import PIL
 
 
@@ -36,6 +36,7 @@ class SampleLogger:
         n_sample_frame: int = 8,
         start_sample_frame: int = None,
         sampling_rate: int = 1,
+        vis_frames: Optional[List[int]] = None,
         **args
         
     ) -> None:
@@ -44,6 +45,7 @@ class SampleLogger:
         self.guidance_scale = guidance_scale
         self.num_inference_steps = num_inference_steps
         self.strength = strength
+        self.vis_frames = vis_frames
         
         if sample_seeds is None:
             max_num_samples_per_prompt = int(1e5)
@@ -178,6 +180,7 @@ class SampleLogger:
                     cluster_inversion_feature= cluster_inversion_feature,
                     vis_cross_attn = vis_cross_attn,
                     attn_inversion_dict=attn_inversion_dict,
+                    vis_frames=self.vis_frames,
                 )
 
                 sequence = sequence_return.images[0]
