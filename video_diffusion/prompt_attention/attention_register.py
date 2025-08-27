@@ -523,7 +523,7 @@ def register_attention_control(model, controller, text_cond, clip_length, height
         #     hidden_states = rearrange(hidden_states, "b (f d) c -> (b f) d c", f=clip_length)
         #     return hidden_states
 
-        def fully_frame_forward(hidden_states, encoder_hidden_states=None, attention_mask=None, clip_length=None, inter_frame=False, **kwargs):
+        def fully_frame_forward(hidden_states, encoder_hidden_states=None, attention_mask=None, clip_length=None, inter_frame=False, time_causal=True, **kwargs):
             # print(" ====== attn1 is displayed by attention register (attention_register.py line 377) ======")
             batch_size, sequence_length, _ = hidden_states.shape
             # print("hidden_states.shape",hidden_states.shape)
@@ -599,7 +599,7 @@ def register_attention_control(model, controller, text_cond, clip_length, height
             if self._use_memory_efficient_attention_xformers and query.shape[-2] > clip_length*(32 ** 2):
                 # print("--- use xformer ---")
                 ############### time_causal = True -> modified full frame attention ###############
-                hidden_states = _memory_efficient_attention_xformers(query, key, value, attention_mask, time_causal = True)
+                hidden_states = _memory_efficient_attention_xformers(query, key, value, attention_mask, time_causal = time_causal)
 
                 # Some versions of xformers return output in fp32, cast it back to the dtype of the input
                 hidden_states = hidden_states.to(query.dtype)

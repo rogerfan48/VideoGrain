@@ -131,9 +131,9 @@ pip install nvitop
 ```
 
 ## Causal attention modified
-In video_diffusion/prompt_attention/attention_register.py Line 466
+In video_diffusion/prompt_attention/attention_register.py function fully_frame_forward
 ```python
-hidden_states = _memory_efficient_attention_xformers(query, key, value, attention_mask, time_causal = True)
+def fully_frame_forward(hidden_states, encoder_hidden_states=None, attention_mask=None, clip_length=None, inter_frame=False, time_causal=True, **kwargs):
 ```
 - if time_causal =True : open previous frame attention mask
 - if time_causal =False : close previous frame attention mask
