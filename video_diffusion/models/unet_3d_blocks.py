@@ -29,6 +29,7 @@ def get_down_block(
 ):
     down_block_type = down_block_type[7:] if down_block_type.startswith("UNetRes") else down_block_type
     if down_block_type == "DownBlockPseudo3D":
+        # print("DownBlockPseudo3D")
         return DownBlockPseudo3D(
             num_layers=num_layers,
             in_channels=in_channels,
@@ -45,6 +46,7 @@ def get_down_block(
     elif down_block_type == "CrossAttnDownBlockPseudo3D":
         if cross_attention_dim is None:
             raise ValueError("cross_attention_dim must be specified for CrossAttnDownBlockPseudo3D")
+        # print("CrossAttnDownBlockPseudo3D")
         return CrossAttnDownBlockPseudo3D(
             num_layers=num_layers,
             in_channels=in_channels,
@@ -91,6 +93,7 @@ def get_up_block(
 ):
     up_block_type = up_block_type[7:] if up_block_type.startswith("UNetRes") else up_block_type
     if up_block_type == "UpBlockPseudo3D":
+        # print("UpBlockPseudo3D")
         return UpBlockPseudo3D(
             num_layers=num_layers,
             in_channels=in_channels,
@@ -107,6 +110,7 @@ def get_up_block(
     elif up_block_type == "CrossAttnUpBlockPseudo3D":
         if cross_attention_dim is None:
             raise ValueError("cross_attention_dim must be specified for CrossAttnUpBlockPseudo3D")
+        # print("CrossAttnUpBlockPseudo3D")
         return CrossAttnUpBlockPseudo3D(
             num_layers=num_layers,
             in_channels=in_channels,
@@ -314,7 +318,7 @@ class CrossAttnDownBlockPseudo3D(nn.Module):
 
         for resnet, attn in zip(self.resnets, self.attentions):
             if self.training and self.gradient_checkpointing:
-
+                # print("### CrossAttnDownBlockPseudo3D and training is True (unet 3d block line 321) ###")
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
                         if return_dict is not None:
@@ -333,6 +337,7 @@ class CrossAttnDownBlockPseudo3D(nn.Module):
                     encoder_hidden_states,
                 )[0]
             else:
+                # print("### CrossAttnDownBlockPseudo3D and training is False  (unet 3d block line 340) ###")
                 hidden_states = resnet(hidden_states, temb)
                 hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states, **kwargs).sample
 

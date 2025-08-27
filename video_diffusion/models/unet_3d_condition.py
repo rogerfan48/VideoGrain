@@ -323,6 +323,7 @@ class UNetPseudo3DConditionModel(ModelMixin, ConfigMixin):
         # The overall upsampling factor is equal to 2 ** (# num of upsampling layears).
         # However, the upsampling interpolation output size can be forced to fit any upsampling size
         # on the fly if necessary.
+        # print("unet forward")
         default_overall_up_factor = 2**self.num_upsamplers
 
         # upsample size should be forwarded when sample is not a multiple of `default_overall_up_factor`
@@ -384,6 +385,7 @@ class UNetPseudo3DConditionModel(ModelMixin, ConfigMixin):
         down_block_res_samples = (sample,)
         for downsample_block in self.down_blocks:
             if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
+                # print("### down sample has cross attention ###")
                 sample, res_samples = downsample_block(
                     hidden_states=sample,
                     temb=emb,
@@ -392,6 +394,7 @@ class UNetPseudo3DConditionModel(ModelMixin, ConfigMixin):
                     **kwargs,
                 )
             else:
+                # print("### down sample has no cross attention ###")
                 sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
 
             down_block_res_samples += res_samples
@@ -445,6 +448,7 @@ class UNetPseudo3DConditionModel(ModelMixin, ConfigMixin):
                 upsample_size = down_block_res_samples[-1].shape[2:]
 
             if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
+                # print("### up sample has cross attention ###")
                 sample = upsample_block(
                     hidden_states=sample,
                     temb=emb,
@@ -457,6 +461,7 @@ class UNetPseudo3DConditionModel(ModelMixin, ConfigMixin):
                 # if up_block_additional_residual is not None and sample.shape[-1] == 32: 
                 #     sample = sample + up_block_additional_residual.unsqueeze(0)  ### dift embedding for key point
             else:
+                # print("### up sample has no cross attention ###")
                 sample = upsample_block(
                     hidden_states=sample,
                     temb=emb,

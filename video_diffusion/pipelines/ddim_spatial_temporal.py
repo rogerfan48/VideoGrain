@@ -674,7 +674,7 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         attn_inversion_dict: dict=None,
         **kwargs,
     ):
-
+        print("in pipeline call function.")
         # 0. Default height and width to unet
         t , c , height, width = image.shape
         prompt = OmegaConf.to_container(prompt, resolve=True)
@@ -720,6 +720,7 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
                                                 disk_store = False,
                                                 video = image,
                                                 )  
+        print("register_attention_control")
         attention_util.register_attention_control(self, editor, text_cond, clip_length, downsample_height,downsample_width,ddim_inversion=False)
         #============do visualization for st-layout attn===============#
 
@@ -730,9 +731,11 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
 
         # 3. Encode input prompt  
         prompt = prompt[:1]
+        print("Prepare text embedding ...")
         text_embeddings = self._encode_prompt(
             prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt
         )
+        print("Prepare source latent ...")
         source_latents = self.prepare_source_latents(
             image, batch_size, num_images_per_prompt, 
             # text_embeddings.dtype, device, 
@@ -741,6 +744,7 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         )
 
         # 7. Denoising loop
+        # print("Start Denoise")
         num_warmup_steps = len(time_steps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps* (1-blending_percentage)) as progress_bar:
             for i, t in enumerate(time_steps[int(len(time_steps) * blending_percentage):]):
@@ -779,7 +783,7 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
                         for down_block_res_sample in down_block_res_samples
                     ]
                     mid_block_res_sample *= controlnet_conditioning_scale
-                    
+                    # print("Start pred noise")
                     noise_pred = self.unet(
                         latent_model_input,
                         t,
