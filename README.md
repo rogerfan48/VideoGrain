@@ -128,3 +128,11 @@ accelerate launch test.py --config config/person_across_config.yaml
 # GPU monitoring tools
 sudo apt install nvtop
 pip install nvitop
+```
+
+## Causal attention modified
+```python
+hidden_states = _memory_efficient_attention_xformers(query, key, value, attention_mask, time_causal = True)
+```
+- if time_causal =True : open previous frame attention mask
+- if time_causal =False : close previous frame attention mask
