@@ -131,6 +131,7 @@ pip install nvitop
 ```
 
 ## Causal attention modified
+In video_diffusion/prompt_attention/attention_register.py Line 466
 ```python
 hidden_states = _memory_efficient_attention_xformers(query, key, value, attention_mask, time_causal = True)
 ```
