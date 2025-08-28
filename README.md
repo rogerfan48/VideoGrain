@@ -128,3 +128,12 @@ accelerate launch test.py --config config/person_across_config.yaml
 # GPU monitoring tools
 sudo apt install nvtop
 pip install nvitop
+```
+
+## Causal attention modified
+In video_diffusion/prompt_attention/attention_register.py function fully_frame_forward
+```python
+def fully_frame_forward(hidden_states, encoder_hidden_states=None, attention_mask=None, clip_length=None, inter_frame=False, time_causal=True, **kwargs):
+```
+- if time_causal =True : open previous frame attention mask
+- if time_causal =False : close previous frame attention mask

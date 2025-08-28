@@ -11,14 +11,17 @@ from diffusers.models.cross_attention import CrossAttention
 from diffusers.models.attention import FeedForward, AdaLayerNorm
 from diffusers.utils import BaseOutput
 from diffusers.utils.import_utils import is_xformers_available
-
+from tqdm import tqdm
 from einops import rearrange
 import numpy as np
 import os 
 from PIL import Image
 import glob
 
-
+# def debug_log(msg):
+#     tqdm.write(msg)
+#     with open("debug.log", "a") as f:
+#         f.write(msg + "\n")
 @dataclass
 class SpatioTemporalTransformerModelOutput(BaseOutput):
     """torch.FloatTensor of shape [batch x channel x frames x height x width]"""
@@ -102,6 +105,7 @@ class SpatioTemporalTransformerModel(ModelMixin, ConfigMixin):
     def forward(
         self, hidden_states, encoder_hidden_states=None, timestep=None, return_dict: bool = True, **kwargs,
     ):
+        # print(" ### SpatioTemporalTransformerModel forward (attention.py line 108) ### ")
         # 1. Input
         clip_length = None
         is_video = hidden_states.ndim == 5
@@ -314,6 +318,7 @@ class SpatioTemporalTransformerBlock(nn.Module):
         clip_length=None,
         **kwargs,
     ):
+        # print("### SpatioTemporalTransformerBlock forward (attention.py line 321) ###")
         # 1. Self-Attention
         norm_hidden_states = (
             self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
@@ -334,9 +339,27 @@ class SpatioTemporalTransformerBlock(nn.Module):
             kwargs.update(clip_length=clip_length)
         if 'SparseCausalAttention_index' in self.model_config.keys():
             kwargs.update(SparseCausalAttention_index = self.model_config['SparseCausalAttention_index'])
-        
+        # print("### start using attn1 calculate hidden states (attention.py line 342) ###")
+        # print("kwargs keys to attn1:", list(kwargs.keys()), flush=True)
+        # print("==== kwargs dump to attn1 ==== attention.py (Line344)")
+        # for k, v in kwargs.items():
+        #     if torch.is_tensor(v):
+        #         print(f"{k}: shape={tuple(v.shape)}, dtype={v.dtype}, device={v.device}")
+        #         if v.numel() < 20:  # 小張量，直接印值
+        #             print(v)
+        #     else:
+        #         print(f"{k}: {v}")
+        # print("==== end kwargs dump ====")
         hidden_states = hidden_states + self.attn1(**kwargs)
-
+        # attn_out = self.attn1(**kwargs)
+        # print("attn_out type:", type(attn_out))
+        # if torch.is_tensor(attn_out):
+        #     print("attn_out shape:", attn_out.shape, "dtype:", attn_out.dtype, "device:", attn_out.device)
+        #     print("attn_out mean:", attn_out.mean().item(), "std:", attn_out.std().item())
+        # else:
+        #     print("attn_out:", attn_out)
+        # print("attn1 type:", type(self.attn1))
+        # print("attn1 MRO:", getattr(self.attn1.__class__, "__mro__", None))
         if clip_length is not None and self.temporal_attention_position == "after_spatial":
             hidden_states = self.apply_temporal_attention(hidden_states, timestep, clip_length)
         # print('hidden_states after 1 self attention',hidden_states.shape)
@@ -362,7 +385,7 @@ class SpatioTemporalTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
-
+        # print("========================================================================")
         # if clip_length is not None and self.temporal_attention_position == "after_feedforward" and self.attn_temporal is not None:
         #     hidden_states = self.apply_temporal_attention(hidden_states, timestep, clip_length)
 
@@ -543,11 +566,12 @@ class FullyFrameAttention(nn.Module):
         norm_num_groups: Optional[int] = None,
     ):
         super().__init__()
+        # print("### initialize FullyFrameAttention ###")
         inner_dim = dim_head * heads
         cross_attention_dim = cross_attention_dim if cross_attention_dim is not None else query_dim
         self.upcast_attention = upcast_attention
         self.upcast_softmax = upcast_softmax
-
+ 
         self.scale = dim_head**-0.5
 
         self.heads = heads
@@ -583,6 +607,7 @@ class FullyFrameAttention(nn.Module):
         self.inject_k = None
 
     def reshape_heads_to_batch_dim(self, tensor):
+        print("### reshape_heads_to_batch_dim function of FullyFrameAttention ###")
         batch_size, seq_len, dim = tensor.shape
         head_size = self.heads
         tensor = tensor.reshape(batch_size, seq_len, head_size, dim // head_size)
@@ -590,6 +615,7 @@ class FullyFrameAttention(nn.Module):
         return tensor
 
     def reshape_batch_dim_to_heads(self, tensor):
+        print("### reshape_batch_dim_to_heads function of FullyFrameAttention ###")
         batch_size, seq_len, dim = tensor.shape
         head_size = self.heads
         tensor = tensor.reshape(batch_size // head_size, head_size, seq_len, dim)
@@ -597,12 +623,14 @@ class FullyFrameAttention(nn.Module):
         return tensor
 
     def set_attention_slice(self, slice_size):
+        print("### set_attention_slice function of FullyFrameAttention ###")
         if slice_size is not None and slice_size > self.sliceable_head_dim:
             raise ValueError(f"slice_size {slice_size} has to be smaller or equal to {self.sliceable_head_dim}.")
 
         self._slice_size = slice_size
     
     def _attention(self, query, key, value, attention_mask=None):
+        print("### _attention function of FullyFrameAttention ###")
         if self.upcast_attention:
             query = query.float()
             key = key.float()
@@ -633,7 +661,7 @@ class FullyFrameAttention(nn.Module):
         return hidden_states
 
     def _sliced_attention(self, query, key, value, sequence_length, dim, attention_mask):
-
+        print("### _sliced_attention function of FullyFrameAttention ###")
         batch_size_attention = query.shape[0]
         hidden_states = torch.zeros(
             (batch_size_attention, sequence_length, dim // self.heads), device=query.device, dtype=query.dtype
@@ -694,8 +722,9 @@ class FullyFrameAttention(nn.Module):
         return hidden_states
 
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, clip_length=None, inter_frame=False,**kwargs):
+        print("### Full dense attention forward (attention.py line 702) ###")
         batch_size, sequence_length, _ = hidden_states.shape
-
+        print(f"Hidden states shape : {hidden_states.shape}, batch size : {batch_size}, sequence length : {sequence_length}")
         encoder_hidden_states = encoder_hidden_states
 
         # h = w = int(math.sqrt(sequence_length))
@@ -706,51 +735,73 @@ class FullyFrameAttention(nn.Module):
 
 
         query = self.to_q(hidden_states)  # (bf) x d(hw) x c
-
+        print(f"Query shape : {query.shape}")
         self.q = query
         if self.inject_q is not None:
+            print("Inject q")
             query = self.inject_q
+        else: 
+            print("Inject q is None.")
         dim = query.shape[-1]
         query_old = query.clone()
         dim = query.shape[-1]
 
         # All frames
+        original_query_shape = query.shape
+        print(f"clip_length : {clip_length}")
         query = rearrange(query, "(b f) d c -> b (f d) c", f=clip_length)
-        
+        print(f"Rearrange query from {original_query_shape} to {query.shape}")
         query = self.reshape_heads_to_batch_dim(query)
-
+        print(f"reshape Q heads to batch dim : {query.shape}")
         if self.added_kv_proj_dim is not None:
             raise NotImplementedError
-
+        print(f"Encoder_hidden_states : {encoder_hidden_states}")
         encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
         key = self.to_k(encoder_hidden_states)
+        print(f"Keys shape : {key.shape}")
         self.k = key
         if self.inject_k is not None:
+            print("Inject k")
             key = self.inject_k
+        else: 
+            print("Inject k is None")
         key_old = key.clone()
         value = self.to_v(encoder_hidden_states)
-
+        print(f"Value shape : {value.shape}")
+        original_key_shape = key.shape
+        original_value_shape = value.shape
         if inter_frame:
+            print("### inter frame ###")
             key = rearrange(key, "(b f) d c -> b f d c", f=clip_length)[:, [0, -1]]
             value = rearrange(value, "(b f) d c -> b f d c", f=clip_length)[:, [0, -1]]
             key = rearrange(key, "b f d c -> b (f d) c",)
             value = rearrange(value, "b f d c -> b (f d) c")
+            print(f"Rearrange query from {original_key_shape} to {key.shape}")
+            print(f"Rearrange query from {original_value_shape} to {value.shape}")
         else:
             # All frames
+            print("### all frame ###")
             key = rearrange(key, "(b f) d c -> b (f d) c", f=clip_length)
             value = rearrange(value, "(b f) d c -> b (f d) c", f=clip_length)
-
+            print(f"Rearrange query from {original_key_shape} to {key.shape}")
+            print(f"Rearrange query from {original_value_shape} to {value.shape}")
+            
         key = self.reshape_heads_to_batch_dim(key)
         value = self.reshape_heads_to_batch_dim(value)
-
+        print(f"reshape key heads to batch dim : {key.shape}")
+        print(f"reshape value heads to batch dim : {value.shape}")
+        
         if attention_mask is not None:
+            print("### Attention mask is exist.")
             if attention_mask.shape[-1] != query.shape[1]:
                 target_length = query.shape[1]
                 attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
         # attention, what we cannot get enough of
+        ### cauculate attention score
         if self._use_memory_efficient_attention_xformers:
+            print("### _use_memory_efficient_attention_xformers ### ")
             hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
             # Some versions of xformers return output in fp32, cast it back to the dtype of the input
             hidden_states = hidden_states.to(query.dtype)
@@ -759,18 +810,21 @@ class FullyFrameAttention(nn.Module):
                 hidden_states = self._attention(query, key, value, attention_mask)
             else:
                 hidden_states = self._sliced_attention(query, key, value, sequence_length, dim, attention_mask)
-        
-        
+                
+        print("====== Start flow guided mechanism =====")
         if [h,w] in kwargs['flatten_res']:
-
+        
             hidden_states = rearrange(hidden_states, "b (f d) c -> (b f) d c", f=clip_length)
+            print(f"hidden states shape for flow guided attention : {hidden_states.shape}")
             if self.group_norm is not None:
                 hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
             if kwargs["old_qk"] == 1:
+                print("Using old query and key instead of full dense hidden state.")
                 query = query_old
                 key = key_old
             else:
+                print("Using full dense hidden state.")
                 query = hidden_states
                 key = hidden_states
             value = hidden_states
@@ -780,10 +834,11 @@ class FullyFrameAttention(nn.Module):
             mask = rearrange(kwargs["mask"], '(f n) l -> f n l', f=clip_length, n=sequence_length)
             mask = torch.cat([mask[:, :, 0].unsqueeze(-1), mask[:, :, -clip_length+1:]], dim=-1)
 
-            # print('traj',traj.shape)
-            # print('mask',mask.shape)
+            print('traj',traj.shape)
+            print('mask',mask.shape)
 
             traj_key_sequence_inds = torch.cat([traj[:, :, 0, :].unsqueeze(-2), traj[:, :, -clip_length+1:, :]], dim=-2)
+            print(f"traj sequence id : {traj_key_sequence_inds}")
             t_inds = traj_key_sequence_inds[:, :, :, 0]
             x_inds = traj_key_sequence_inds[:, :, :, 1]
             y_inds = traj_key_sequence_inds[:, :, :, 2]
@@ -806,6 +861,7 @@ class FullyFrameAttention(nn.Module):
             # print('key_tempo',key_tempo.shape)
 
             # flow attention
+            print("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             query_tempo = self.reshape_heads_to_batch_dim3(query_tempo)
             key_tempo = self.reshape_heads_to_batch_dim3(key_tempo)
             value_tempo = self.reshape_heads_to_batch_dim3(value_tempo)

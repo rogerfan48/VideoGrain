@@ -7,4 +7,6 @@ logs/**
 ckpt/*
 !ckpt/download.sh
 videograin_data.tar.gz
+.ipynb_checkpoints
+__MACOSX/**
 __pycache__

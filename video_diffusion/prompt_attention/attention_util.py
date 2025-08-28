@@ -251,12 +251,15 @@ class ST_Layout_Attn_Control(AttentionControl, abc.ABC):
             min_value = sim.min(-1)[0].unsqueeze(-1)
             max_value = sim.max(-1)[0].unsqueeze(-1) 
             if self.attention_type == "SparseCausalAttention":
+                print("SparseCausalAttention")
                 mask = self.sreg_maps[sim.size(2)].repeat(1,num_heads,1,1)
                 size_reg = self.reg_sizes[sim.size(2)].repeat(1,num_heads,1,1)
             elif self.attention_type ==  "FullyFrameAttention":
+                print("FullyFrameAttention")
                 mask = self.sreg_maps[sim.size(2)//self.clip_length].repeat(1,num_heads,1,1)
                 size_reg = self.reg_sizes[sim.size(2)//self.clip_length].repeat(1,num_heads,1,1)
             elif self.attention_type ==  "FullyFrameAttention_sliced_attn":
+                print("FullyFrameAttention_sliced_attn")
                 mask = self.sreg_maps[sim.size(2)//self.clip_length]
                 size_reg = self.reg_sizes[sim.size(2)//self.clip_length]
 
@@ -273,7 +276,7 @@ class ST_Layout_Attn_Control(AttentionControl, abc.ABC):
             sim -= ~(mask>0)*size_reg*self.sreg*treg*(sim-min_value) 
 
         else:
-            
+            print("CrossAttention")
             min_value = sim.min(-1)[0].unsqueeze(-1)
             max_value = sim.max(-1)[0].unsqueeze(-1)  
             mask = self.creg_maps[sim.size(2)].repeat(1,num_heads,1,1)
@@ -549,7 +552,7 @@ class ST_Layout_Attn_ControlEdit(AttentionStore, abc.ABC):
     def forward(self, sim, is_cross: bool, place_in_unet: str,**kwargs):
         # Always store in additional_attention_store
         if self.additional_attention_store is not None:
-            self.additional_attention_store.forward(sim, is_cross, place_in_unet)
+            self.additional_attention_store.forward(sim, is_cross, place_in_unet, **kwargs)
         
         # print("self.cur_step",self.cur_step)
         key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
@@ -573,12 +576,15 @@ class ST_Layout_Attn_ControlEdit(AttentionStore, abc.ABC):
             max_value = sim.max(-1)[0].unsqueeze(-1) 
 
             if self.attention_type == "SparseCausalAttention":
+                print("SparseCausalAttention")
                 mask = self.sreg_maps[sim.size(2)].repeat(1,num_heads,1,1)
                 size_reg = self.reg_sizes[sim.size(2)].repeat(1,num_heads,1,1)
             elif self.attention_type ==  "FullyFrameAttention":
+                print("FullyFrameAttention")
                 mask = self.sreg_maps[sim.size(2)//self.clip_length].repeat(1,num_heads,1,1)
                 size_reg = self.reg_sizes[sim.size(2)//self.clip_length].repeat(1,num_heads,1,1)
             elif self.attention_type ==  "FullyFrameAttention_sliced_attn":
+                print("FullyFrameAttention_sliced_attn")
                 mask = self.sreg_maps[sim.size(2)//self.clip_length]
                 size_reg = self.reg_sizes[sim.size(2)//self.clip_length]
 
@@ -591,7 +597,7 @@ class ST_Layout_Attn_ControlEdit(AttentionStore, abc.ABC):
             
         else:
             #Modulate cross-attention
-
+            print("CrossAttention")
             min_value = sim.min(-1)[0].unsqueeze(-1)
             max_value = sim.max(-1)[0].unsqueeze(-1) 
             mask = self.creg_maps[sim.size(2)].repeat(1,num_heads,1,1)

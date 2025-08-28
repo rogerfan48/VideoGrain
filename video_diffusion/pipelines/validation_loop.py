@@ -148,10 +148,11 @@ class SampleLogger:
             #             ])
         #masks_all, layouts_all = self.read_layout_and_merge_masks()
         #for idx, (prompt, masks, layouts) in enumerate(tqdm(zip(self.editing_prompts, masks_all, layouts_all), desc="Generating sample images")):
-        for idx, prompt in enumerate(tqdm(self.editing_prompts, desc="Generating sample images")):
+        for idx, prompt in enumerate(tqdm(self.editing_prompts, desc="Generating sample images", disable=True)):
             for seed in self.sample_seeds:
                 generator = torch.Generator(device=device)
                 generator.manual_seed(seed)
+                print("pipeline start !!!")
                 sequence_return = pipeline(
                     prompt=prompt,
                     image=image, # torch.Size([8, 3, 512, 512])
@@ -181,6 +182,7 @@ class SampleLogger:
                     vis_cross_attn = vis_cross_attn,
                     attn_inversion_dict=attn_inversion_dict,
                     vis_frames=self.vis_frames,
+                    **{"disable_progress_bar": True} 
                 )
 
                 sequence = sequence_return.images[0]

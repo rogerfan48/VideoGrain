@@ -1,0 +1,3 @@
+- `01_stand_walk_0`, `02_walk_walk_0`: original testing with spiderman and superman
+- `02_walk_walk_1`, `run_two_man_0`: with polar bear and spiderman
+- `02_walk_walk_2`: polar bear and spiderman with jay
