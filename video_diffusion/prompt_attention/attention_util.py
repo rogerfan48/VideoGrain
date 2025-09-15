@@ -550,11 +550,9 @@ class ST_Layout_Attn_ControlEdit(AttentionStore, abc.ABC):
 
 
     def forward(self, sim, is_cross: bool, place_in_unet: str,**kwargs):
-        # Always store in additional_attention_store
-        if self.additional_attention_store is not None:
-            self.additional_attention_store.forward(sim, is_cross, place_in_unet, **kwargs)
-        
-        # print("self.cur_step",self.cur_step)
+        super(ST_Layout_Attn_ControlEdit, self).forward(sim, is_cross, place_in_unet,**kwargs)
+        print("ST_Layout_Attn_ControlEdit attention_util.py (line 362)")
+        print("self.cur_step",self.cur_step)
         key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
         
         self.update_attention_position_dict(key)
