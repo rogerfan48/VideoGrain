@@ -299,8 +299,42 @@ def register_attention_control(model, controller, text_cond, clip_length, height
             # dropout
             hidden_states = self.to_out[1](hidden_states)
             return hidden_states
+################################################################################################################
 
-        def _sliced_attention(query, key, value, sequence_length, dim, attention_mask):
+        def build_frame_causal_mask(sequence_length, clip_length, device, dtype,
+                                    include_same_frame=True):
+            """
+            回傳形狀為 (1, Q, K) 的 additive mask，允許位置=0，禁止位置=-inf
+            Q=K=sequence_length=t*hw
+            include_same_frame=True  -> 允許同一幀內互看 (<= 幀下三角)
+            include_same_frame=False -> 僅允許過去幀 (< 幀嚴格下三角)
+            """
+            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            t = clip_length
+            assert sequence_length % t == 0, "sequence_length 必須能被 clip_length 整除"
+            hw = sequence_length // t
+        
+            # 幀層級下三角 (t x t)
+            time_tri = torch.tril(torch.ones(t, t, device=device, dtype=torch.bool),
+                                  diagonal=0 if include_same_frame else -1)  # <= or <
+            # 將每個幀格放大成 hw x hw 的 block（Kronecker 乘積）
+            block = torch.ones(hw, hw, device=device, dtype=torch.bool)
+            frame_block_mask = torch.kron(time_tri, block)  # (t*hw, t*hw) = (Q,K)
+        
+            # 轉成 additive mask：允許=0，禁止=-inf
+            finfo = torch.finfo(torch.float32 if dtype == torch.float16 else dtype)
+            additive = torch.where(frame_block_mask, torch.zeros(1, device=device, dtype=torch.float32),
+                                   torch.full((1,), finfo.min, device=device, dtype=torch.float32))
+            # 形狀對齊到 (1, Q, K) 以利 broadcast 到 (B*H, Q, K)
+            additive = additive.view(1, sequence_length, sequence_length)
+        
+            # 若你啟用 upcast_softmax，把 mask 也用 float32，避免精度問題
+            return additive
+
+################################################################################################################
+
+        
+        def _sliced_attention(query, key, value, sequence_length, dim, attention_mask, time_causal):
             #query (bz*heads, t x h x w, org_dim//heads )
             # print("================== _sliced attention ====================")
             is_cross = False
@@ -335,7 +369,10 @@ def register_attention_control(model, controller, text_cond, clip_length, height
                 )
 
                 if attention_mask is not None:
-                    attn_slice = attn_slice + attention_mask[start_idx:end_idx]
+                    if time_causal:
+                        attn_slice = attn_slice + attention_mask[:1]
+                    else:
+                        attn_slice = attn_slice + attention_mask[start_idx:end_idx]
 
                 if self.upcast_softmax:
                     attn_slice = attn_slice.float()
@@ -386,145 +423,11 @@ def register_attention_control(model, controller, text_cond, clip_length, height
             hidden_states = reshape_batch_dim_to_heads(hidden_states)
             return hidden_states
 
-        # def fully_frame_forward(hidden_states, encoder_hidden_states=None, attention_mask=None,
-        #                         clip_length=None, inter_frame=False, flow_only=True, **kwargs):
-        #     batch_size, sequence_length, _ = hidden_states.shape
-        #     h = kwargs['height']; w = kwargs['width']
-        #     ...
-        #     query = self.to_q(hidden_states)
-        #     self.q = query
-        #     if self.inject_q is not None:
-        #         query = self.inject_q
-        #     dim = query.shape[-1]
-        #     query_old = query.clone()
-        
-        #     # 準備 K/V（flow attention 也需要用到）
-        #     encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-        #     key_old = self.to_k(encoder_hidden_states)
-        #     if self.inject_k is not None:
-        #         key_old = self.inject_k
-        #     value_old = self.to_v(encoder_hidden_states)
-        
-        #     # ========= (1) full-frame attention：只有在非 flow_only 時才跑 =========
-        #     if not flow_only:
-        #         query_ff = rearrange(query, "(b f) d c -> b (f d) c", f=clip_length)
-        #         query_ff = reshape_heads_to_batch_dim(query_ff)
-        #         if inter_frame:
-        #             key_ff = rearrange(key_old, "(b f) d c -> b f d c", f=clip_length)[:, [0, -1]]
-        #             value_ff = rearrange(value_old, "(b f) d c -> b f d c", f=clip_length)[:, [0, -1]]
-        #             key_ff   = rearrange(key_ff,   "b f d c -> b (f d) c")
-        #             value_ff = rearrange(value_ff, "b f d c -> b (f d) c")
-        #         else:
-        #             key_ff   = rearrange(key_old,   "(b f) d c -> b (f d) c", f=clip_length)
-        #             value_ff = rearrange(value_old, "(b f) d c -> b (f d) c", f=clip_length)
-        #         key_ff   = reshape_heads_to_batch_dim(key_ff)
-        #         value_ff = reshape_heads_to_batch_dim(value_ff)
-        
-        #         self._slice_size = 1
-        #         sequence_length_full_frame = query_ff.shape[1]
-        
-        #         if self._use_memory_efficient_attention_xformers and query_ff.shape[-2] > clip_length*(32 ** 2):
-        #             hidden_states = _memory_efficient_attention_xformers(
-        #                 query_ff, key_ff, value_ff, attention_mask, time_causal=True
-        #             ).to(query_ff.dtype)
-        #         else:
-        #             hidden_states = _sliced_attention(
-        #                 query_ff, key_ff, value_ff, sequence_length_full_frame, dim, attention_mask
-        #             )
-        #     # ========= (2) flow attention：flow_only==True 時直接執行 =========
-        #     if flow_only or ([h, w] in kwargs.get('flatten_res', [])):
-        #         # 用「舊 qk」或「當前 hidden」來當 Q/K 的來源
-        #         if not flow_only:
-        #             # 這裡沿用你原本的 full-frame hidden_states → group_norm 之後再決定 q/k/value
-        #             hidden_states = rearrange(hidden_states, "b (f d) c -> (b f) d c", f=clip_length)
-        #             if self.group_norm is not None:
-        #                 hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
-        
-        #         # 當 flow_only=True，沒有 full-frame 產生的 hidden_states；直接用 query_old 走
-        #         if flow_only:
-        #             # 這裡模擬你的原邏輯：old_qk==1 時用舊的 q/k，否則用「規範化後的 hidden」。
-        #             old_qk = int(kwargs.get("old_qk", 1))
-        #             if old_qk == 1:
-        #                 query = query_old
-        #                 key   = key_old
-        #             else:
-        #                 # 以 hidden_states 為基底；若沒有 group_norm，直接用 query_old 當作 hidden
-        #                 hidden_states = query_old
-        #                 if self.group_norm is not None:
-        #                     hs = rearrange(hidden_states, "(b f) d c -> b (f d) c", f=clip_length)
-        #                     hs = self.group_norm(hs.transpose(1,2)).transpose(1,2)
-        #                     hidden_states = rearrange(hs, "b (f d) c -> (b f) d c", f=clip_length)
-        #                 query = hidden_states
-        #                 key   = hidden_states
-        #             value = query if (kwargs.get("old_qk", 1) != 1) else value_old
-        #         else:
-        #             # 非 flow_only（即先跑過 full-frame）時，沿用你原本的分支
-        #             if kwargs.get("old_qk", 1) == 1:
-        #                 query = query_old
-        #                 key   = key_old
-        #             else:
-        #                 query = hidden_states
-        #                 key   = hidden_states
-        #             value = hidden_states
-        
-        #         # === 以下完全保留你原本的 flow attention 寫法 ===
-        #         traj = kwargs["traj"]
-        #         traj = rearrange(traj, '(f n) l d -> f n l d', f=clip_length, n=sequence_length)
-        #         mask = rearrange(kwargs["mask"], '(f n) l -> f n l', f=clip_length, n=sequence_length)
-        #         mask = torch.cat([mask[:, :, 0].unsqueeze(-1), mask[:, :, -clip_length+1:]], dim=-1)
-        
-        #         traj_key_sequence_inds = torch.cat(
-        #             [traj[:, :, 0, :].unsqueeze(-2), traj[:, :, -clip_length+1:, :]],
-        #             dim=-2
-        #         )
-        #         t_inds = traj_key_sequence_inds[:, :, :, 0]
-        #         x_inds = traj_key_sequence_inds[:, :, :, 1]
-        #         y_inds = traj_key_sequence_inds[:, :, :, 2]
-        
-        #         anchor   = t_inds[:, :, 0].unsqueeze(-1).expand_as(t_inds)
-        #         traj_mask = t_inds <= anchor
-        #         t_inds = torch.where(traj_mask, t_inds, torch.zeros_like(t_inds))
-        #         x_inds = torch.where(traj_mask, x_inds, torch.zeros_like(x_inds))
-        #         y_inds = torch.where(traj_mask, y_inds, torch.zeros_like(y_inds))
-        
-        #         query_tempo = query.unsqueeze(-2)
-        #         _key   = rearrange(key,   '(b f) (h w) d -> b f h w d',
-        #                            b=int(batch_size/clip_length), f=clip_length, h=h, w=w)
-        #         _value = rearrange(value, '(b f) (h w) d -> b f h w d',
-        #                            b=int(batch_size/clip_length), f=clip_length, h=h, w=w)
-        #         key_tempo   = _key[:,   t_inds, x_inds, y_inds]
-        #         value_tempo = _value[:, t_inds, x_inds, y_inds]
-        #         key_tempo   = rearrange(key_tempo,   'b f n l d -> (b f) n l d')
-        #         value_tempo = rearrange(value_tempo, 'b f n l d -> (b f) n l d')
-        
-        #         keep_mask = mask & traj_mask
-        #         mask4attn = rearrange(torch.stack([keep_mask, keep_mask]), 'b f n l -> (b f) n l')
-        #         mask4attn = mask4attn[:, None].repeat(1, self.heads, 1, 1).unsqueeze(-2)
-        
-        #         attn_bias = torch.zeros_like(mask4attn, dtype=key_tempo.dtype)
-        #         attn_bias[~mask4attn] = -torch.inf
-        
-        #         query_tempo = reshape_heads_to_batch_dim3(query_tempo)
-        #         key_tempo   = reshape_heads_to_batch_dim3(key_tempo)
-        #         value_tempo = reshape_heads_to_batch_dim3(value_tempo)
-        
-        #         attn_matrix2 = query_tempo @ key_tempo.transpose(-2, -1) / math.sqrt(query_tempo.size(-1)) + attn_bias
-        #         attn_matrix2 = F.softmax(attn_matrix2, dim=-1)
-        #         out = (attn_matrix2 @ value_tempo).squeeze(-2)
-        
-        #         hidden_states = rearrange(
-        #             out, '(b f) k (h w) d -> b (f h w) (k d)',
-        #             b=int(batch_size/clip_length), f=clip_length, h=h, w=w
-        #         )
-        
-        #     # 線性投影 + dropout（保持不變）
-        #     hidden_states = self.to_out[0](hidden_states)
-        #     hidden_states = self.to_out[1](hidden_states)
-        #     hidden_states = rearrange(hidden_states, "b (f d) c -> (b f) d c", f=clip_length)
-        #     return hidden_states
 
-        def fully_frame_forward(hidden_states, encoder_hidden_states=None, attention_mask=None, clip_length=None, inter_frame=False, time_causal=True, **kwargs):
-            # print(" ====== attn1 is displayed by attention register (attention_register.py line 377) ======")
+        def fully_frame_forward(hidden_states, encoder_hidden_states=None, attention_mask=None, clip_length=None, inter_frame=False, flow_only=False, time_causal=True, **kwargs):
+            print(" ====== attn1 is displayed by attention register (attention_register.py line 377) ======")
+            # print(encoder_hidden_states) # None
+            
             batch_size, sequence_length, _ = hidden_states.shape
             # print("hidden_states.shape",hidden_states.shape)
             # print("sequence_length",sequence_length)
@@ -533,12 +436,13 @@ def register_attention_control(model, controller, text_cond, clip_length, height
             h = kwargs['height']
             w = kwargs['width']
             if self.group_norm is not None:
+                # print("group norm") # no group norm
                 hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
             query = self.to_q(hidden_states)  # (bf) x d(hw) x c
             self.q = query
             if self.inject_q is not None:
-                print(f"--- Inject q is {self.inject_q} ---")
+                # print(f"--- Inject q is {self.inject_q} ---") # NO Inject q
                 query = self.inject_q
     
             dim = query.shape[-1]
@@ -553,82 +457,231 @@ def register_attention_control(model, controller, text_cond, clip_length, height
             # print(f"--- reshape_heads_to_batch Query shape is {query.shape} ---")
             if self.added_kv_proj_dim is not None:
                 raise NotImplementedError
-            # if encoder_hidden_states is not None:
-            #     print("--- encoder_hidden_states is not None ---")
-            # else:
-            #     print("--- Using hidden states instead of encoder hidden state ---")
+    
             encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+
+                
             key = self.to_k(encoder_hidden_states)
             self.k = key
             if self.inject_k is not None:
                 key = self.inject_k
             key_old = key.clone()
             value = self.to_v(encoder_hidden_states)
+            if flow_only:
+                encoder_hidden_states = rearrange(encoder_hidden_states, "(b f) d c -> b (f d) c", f=clip_length)
+                hidden_states = encoder_hidden_states
+            print(f"encoder hidden state : {encoder_hidden_states.shape}") # [30, 4096, 320]
+            value_old = value.clone()
+            print(f"value old : {value_old.shape}") # [30, 4096, 320]
+            if not flow_only:
 
-            if inter_frame:
-                # print("--- Inter frame is True ---")
-                key = rearrange(key, "(b f) d c -> b f d c", f=clip_length)[:, [0, -1]]
-                value = rearrange(value, "(b f) d c -> b f d c", f=clip_length)[:, [0, -1]]
-                key = rearrange(key, "b f d c -> b (f d) c",)
-                value = rearrange(value, "b f d c -> b (f d) c")
-            else:
-                # All frames
-                # print("--- All frame is True ---")
-                key = rearrange(key, "(b f) d c -> b (f d) c", f=clip_length)
-                value = rearrange(value, "(b f) d c -> b (f d) c", f=clip_length)
-
-            key = reshape_heads_to_batch_dim(key)
-            value = reshape_heads_to_batch_dim(value)
-            # print(f"--- key shape is {key.shape}")  # [16, 61440, 40]
-            # print(f"--- value shape is {value.shape}") # [16, 61440, 40]
-            
-            if attention_mask is not None:
-                if attention_mask.shape[-1] != query.shape[1]:
-                    target_length = query.shape[1]
-                    attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
-                    attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
-                    # print(f"--- attention mask shape is {attention_mask.shape}")
-            # else:
-            #     print("--- Attention mask is none. ---")
+                if inter_frame:
+                    print("full is using.")
+                    # print("--- Inter frame is True ---")
+                    key = rearrange(key, "(b f) d c -> b f d c", f=clip_length)[:, [0, -1]]
+                    value = rearrange(value, "(b f) d c -> b f d c", f=clip_length)[:, [0, -1]]
+                    key = rearrange(key, "b f d c -> b (f d) c",)
+                    value = rearrange(value, "b f d c -> b (f d) c")
+                else:
+                    # All frames
+                    print("--- All frame is True ---")
+                    key = rearrange(key, "(b f) d c -> b (f d) c", f=clip_length)
+                    value = rearrange(value, "(b f) d c -> b (f d) c", f=clip_length)
     
-            #print("query.shape[0]",query.shape[0])  # 16
-            self._slice_size = 1   ### 8
-            sequence_length_full_frame = query.shape[1]
-
-            # attention, what we cannot get enough of
-            if self._use_memory_efficient_attention_xformers and query.shape[-2] > clip_length*(32 ** 2):
-                # print("--- use xformer ---")
-                ############### time_causal = True -> modified full frame attention ###############
-                hidden_states = _memory_efficient_attention_xformers(query, key, value, attention_mask, time_causal = time_causal)
-
-                # Some versions of xformers return output in fp32, cast it back to the dtype of the input
-                hidden_states = hidden_states.to(query.dtype)
+                key = reshape_heads_to_batch_dim(key)
+                value = reshape_heads_to_batch_dim(value)
+                # print(f"--- key shape is {key.shape}")  # [16, 61440, 40]
+                # print(f"--- value shape is {value.shape}") # [16, 61440, 40]
                 
-            else:
-                # print("--- slice attention ---")
-                # if ddim_inversion:
-                # #if self._slice_size is None or query.shape[0] // self._slice_size == 1:
-                #     hidden_states = _attention(query, key, value, attention_mask)
+                if attention_mask is not None:
+                    if attention_mask.shape[-1] != query.shape[1]:
+                        target_length = query.shape[1]
+                        attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
+                        attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
+                        print(f"--- attention mask shape is {attention_mask.shape}")  # no attention mask
                 # else:
+                #     print("--- Attention mask is none. ---")
+        
+                #print("query.shape[0]",query.shape[0])  # 16
+                self._slice_size = 1   ### 8
+                sequence_length_full_frame = query.shape[1]
     
-                hidden_states = _sliced_attention(query, key, value, sequence_length_full_frame, dim, attention_mask)
+                # attention, what we cannot get enough of
+                if self._use_memory_efficient_attention_xformers and query.shape[-2] > clip_length*(32 ** 2):
+                    print("--- use xformer ---")
+                    ############### time_causal = True -> modified full frame attention ###############
+                    hidden_states = _memory_efficient_attention_xformers(query, key, value, attention_mask, time_causal = time_causal)
+    
+                    # Some versions of xformers return output in fp32, cast it back to the dtype of the input
+                    hidden_states = hidden_states.to(query.dtype)
+                    encoder_hidden_states = hidden_states
+                    print(f"after full frame attn : {encoder_hidden_states.shape}")
+                else:
+                    print("--- slice attention ---")
+                    # if ddim_inversion:
+                    # #if self._slice_size is None or query.shape[0] // self._slice_size == 1:
+                    #     hidden_states = _attention(query, key, value, attention_mask)
+                    # else:
+                    # print(f"attention map is {attention_mask}") #None
+###########################################################################################################
+                    if time_causal :
+                        Q = sequence_length_full_frame  # = query.shape[-2]
+                        # 幀級因果遮罩，允許同幀互看（若要嚴格只能看過去幀，把 include_same_frame=False）
+                        attention_mask = build_frame_causal_mask(
+                            sequence_length=Q,
+                            clip_length=clip_length,
+                            device=query.device,
+                            dtype=query.dtype,
+                            include_same_frame=True,
+                        )
 
+###########################################################################################################    
+                        hidden_states = _sliced_attention(query, key, value, sequence_length_full_frame, dim, attention_mask, time_causal)
+                        encoder_hidden_states = hidden_states
+                        print(f"after full frame attn : {encoder_hidden_states.shape}")
+                ## flow attention can see other patch
+            # if controller.__class__.__name__ == "ST_Layout_Attn_ControlEdit":
+            #     print(f"--- [h,w] : {[h,w]}, {kwargs['flatten_res']}")
+            #     if [h,w] in kwargs['flatten_res']:
+            #         print("--- start flow guided attention ---")
+                
+            #         encoder_hidden_states = rearrange(encoder_hidden_states, "b (f d) c -> (b f) d c", f=clip_length)
+            #         if self.group_norm is not None:
+            #             encoder_hidden_states = self.group_norm(encoder_hidden_states.transpose(1, 2)).transpose(1, 2)
+                
+            #         if kwargs["old_qk"] == 1:
+            #             query = query_old
+            #             key = key_old
+            #             print(f"flow query : {query.shape}") # [30, 4096, 320]
+            #             print(f"flow key : {key.shape}")     # [30, 4096, 320]
+                
+            #         if not flow_only:
+            #             value = encoder_hidden_states
+            #             print(f"flow value : {value.shape}") # [30, 4096, 320]
+            #         else:
+            #             value = value_old
+            #             print(f"flow old : {value.shape}")
+                
+            #         # ===== traj / seq mask gather =====
+            #         traj = kwargs["traj"]
+            #         traj = rearrange(traj, '(f n) l d -> f n l d', f=clip_length, n=sequence_length)
+                
+            #         mask = rearrange(kwargs["mask"], '(f n) l -> f n l', f=clip_length, n=sequence_length)
+            #         mask = torch.cat([mask[:, :, 0].unsqueeze(-1), mask[:, :, -clip_length+1:]], dim=-1)
+                
+            #         traj_key_sequence_inds = torch.cat([traj[:, :, 0, :].unsqueeze(-2), traj[:, :, -clip_length+1:, :]], dim=-2)
+            #         t_inds = traj_key_sequence_inds[:, :, :, 0]
+            #         x_inds = traj_key_sequence_inds[:, :, :, 1]
+            #         y_inds = traj_key_sequence_inds[:, :, :, 2]
+                
+            #         # ===== 因果遮罩（只能看當前以前）=====
+            #         anchor = t_inds[:, :, 0].unsqueeze(-1).expand_as(t_inds)
+            #         if time_causal:
+            #             traj_mask = t_inds <= anchor
+            #         else:
+            #             traj_mask = torch.ones_like(t_inds, dtype=torch.bool)
+                
+            #         t_inds = torch.where(traj_mask, t_inds, torch.zeros_like(t_inds))
+            #         x_inds = torch.where(traj_mask, x_inds, torch.zeros_like(x_inds))
+            #         y_inds = torch.where(traj_mask, y_inds, torch.zeros_like(y_inds))
+                
+            #         # ===== reshape K/V 成 (b,f,h,w,d) 再依 flow indices 取樣 =====
+            #         _b = int(batch_size/clip_length)
+            #         _key   = rearrange(key,   '(b f) (h w) d -> b f h w d', b=_b, f=clip_length, h=h, w=w)
+            #         _value = rearrange(value, '(b f) (h w) d -> b f h w d', b=_b, f=clip_length, h=h, w=w)
+                
+            #         key_tempo   = _key[:,   t_inds, x_inds, y_inds]     # (b,f,n,l,d)
+            #         value_tempo = _value[:, t_inds, x_inds, y_inds]     # (b,f,n,l,d)
+                
+            #         key_tempo   = rearrange(key_tempo,   'b f n l d -> (b f) n l d')
+            #         value_tempo = rearrange(value_tempo, 'b f n l d -> (b f) n l d')
+                
+            #         # ====== A. 硬遮罩：同區塊 ∩ 因果（使用 sreg_map）========================
+            #         # 1) 取得 sreg_map (B,Q,Q)，Q=h*w；優先用 self.sreg_maps，否則用 kwargs["sreg_maps"]
+            #         sreg_map = controller.sreg_maps[h*w].to(t_inds.device)  
+            #         # if hasattr(self, "sreg_maps") and (h*w) in self.sreg_maps:
+            #         #     sreg_map = self.sreg_maps[h*w].to(t_inds.device)                  # (b,Q,Q)
+            #         # else:
+            #         #     assert "sreg_maps" in kwargs, "sreg_maps not found in kwargs"
+            #         #     m = kwargs["sreg_maps"]
+            #         #     sreg_map = (m[h*w] if isinstance(m, dict) else m).to(t_inds.device)  # (b,Q,Q)
+                
+            #         # 2) 將 (x_inds,y_inds) 轉為平面索引 q=y*w+x，取 anchor 與候選 q 的相似度
+            #         q_tempo  = y_inds * w + x_inds                   # (b,f,n,l)
+            #         anchor_q = q_tempo[..., :1]                      # (b,f,n,1)
+                
+            #         # sreg_map[b, anchor_q, q_tempo] -> (b,f,n,l)
+            #         sreg_exp    = sreg_map[:, None, None, None, :, :]     # (b,1,1,1,Q,Q)
+            #         anchor_q_exp  = anchor_q.unsqueeze(-1)                  # (b,f,n,1,1)
+            #         q_tempo_exp   = q_tempo.unsqueeze(-2)                   # (b,f,n,1,l)
+            #         sim_reg = sreg_exp.gather(dim=-2, index=anchor_q_exp.expand(-1, -1, -1, 1, sreg_map.size(-1)))  # (b,f,n,1,Q)
+            #         sim_reg = sim_reg.gather(dim=-1, index=q_tempo_exp).squeeze(-2).squeeze(-2)                      # (b,f,n,l)
+                
+            #         # 3) 同區塊遮罩（沿用 full-frame 的 (mask>0) 判定；如需門檻可改 (sim_reg>=tau)）
+            #         same_block_mask = (sim_reg > 0)   # (b,f,n,l) bool
+                
+            #         # 4) 與既有遮罩交集：seq_mask(原遮罩) ∩ traj_mask(因果) ∩ same_block(同區塊)
+            #         seq_mask  = mask
+            #         keep_mask = seq_mask & traj_mask & same_block_mask
+                
+            #         # 5) 形成 attn_bias（被遮掉的 logits = -inf）
+            #         mask = rearrange(torch.stack([keep_mask, keep_mask]),  'b f n l -> (b f) n l')
+            #         mask = mask[:, None].repeat(1, self.heads, 1, 1).unsqueeze(-2)  # (bf,heads,n,1,l)
+                
+            #         # ===== build attn & apply =====
+            #         attn_bias = torch.zeros_like(mask, dtype=key_tempo.dtype)
+            #         attn_bias[~mask] = -torch.inf
+                
+            #         query_tempo = query.unsqueeze(-2)  # (bf, n, 1, d)
+            #         query_tempo = reshape_heads_to_batch_dim3(query_tempo)  # (bf,heads,n,1,d/head)
+            #         key_tempo   = reshape_heads_to_batch_dim3(key_tempo)    # (bf,heads,n,l,d/head)
+            #         value_tempo = reshape_heads_to_batch_dim3(value_tempo)  # (bf,heads,n,l,d/head)
+                
+            #         print('query_tempo',query_tempo.shape)
+            #         print('key_tempo',key_tempo.shape)
+            #         print('value_tempo',value_tempo.shape)
+                
+            #         attn_matrix2 = query_tempo @ key_tempo.transpose(-2, -1) / math.sqrt(query_tempo.size(-1))
+            #         attn_matrix2 = attn_matrix2 + attn_bias
+            #         attn_matrix2 = F.softmax(attn_matrix2, dim=-1)
+            #         out = (attn_matrix2 @ value_tempo).squeeze(-2)
+                
+            #         hidden_states = rearrange(out,'(b f) k (h w) d -> b (f h w) (k d)', b=_b, f=clip_length, h=h, w=w)
+                
+            #     # linear proj
+            #     hidden_states = self.to_out[0](hidden_states)
+            #     hidden_states = self.to_out[1](hidden_states)
+            #     hidden_states = rearrange(hidden_states, "b (f d) c -> (b f) d c", f=clip_length)
+            #     return hidden_states
+            # else:
+            ### original flow attention    
+            print(f"--- [h,w] : {[h,w]}, {kwargs['flatten_res']}")
             if [h,w] in kwargs['flatten_res']:
-                # print("--- start flow guided attention ---")
-                hidden_states = rearrange(hidden_states, "b (f d) c -> (b f) d c", f=clip_length)
+                print("--- start flow guided attention ---")
+                # if not flow_only:
+                encoder_hidden_states = rearrange(encoder_hidden_states, "b (f d) c -> (b f) d c", f=clip_length)
                 if self.group_norm is not None:
-                    hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
-
+                    encoder_hidden_states = self.group_norm(encoder_hidden_states.transpose(1, 2)).transpose(1, 2)
+    
                 if kwargs["old_qk"] == 1:
                     # print("--- old query and key for attention ---")
                     query = query_old
                     key = key_old
+                    # print(f"flow query : {query.shape}") # [30, 4096, 320]
+                    # print(f"flow key : {key.shape}") # [30, 4096, 320]
+                # else:
+                #     # print("--- hiden state for attention ---")
+                #     query = encoder_hidden_states
+                #     key = encoder_hidden_states
+                # value = hidden_states
+                if not flow_only:
+                    value = encoder_hidden_states
+                    # print(f"flow value : {value.shape}") # [30, 4096, 320]
                 else:
-                    # print("--- hiden state for attention ---")
-                    query = hidden_states
-                    key = hidden_states
-                value = hidden_states
-
+                    # value_old = rearrange(value_old, "b (f d) c -> (b f) d c", f=clip_length)
+                    value = value_old
+                    # print(f"flow old : {value.shape}")
+                
                 traj = kwargs["traj"]
                 traj = rearrange(traj, '(f n) l d -> f n l d', f=clip_length, n=sequence_length)
                 
@@ -638,20 +691,24 @@ def register_attention_control(model, controller, text_cond, clip_length, height
                 # print(f"--- mask shape is {mask.shape} ---")  # mask shape is torch.Size([15, 4096, 15])
                 #print('traj',traj.shape)
                 #print('mask',mask.shape)
-
+    
                 traj_key_sequence_inds = torch.cat([traj[:, :, 0, :].unsqueeze(-2), traj[:, :, -clip_length+1:, :]], dim=-2)
                 t_inds = traj_key_sequence_inds[:, :, :, 0]
                 x_inds = traj_key_sequence_inds[:, :, :, 1]
                 y_inds = traj_key_sequence_inds[:, :, :, 2]
-
-                ##### attention modification#################################
+    
+                ##### attention modification for previous frames #################################
                 anchor = t_inds[:, :, 0].unsqueeze(-1).expand_as(t_inds)
-                traj_mask = t_inds <= anchor   
+    
+                if time_causal:
+                    traj_mask = t_inds <= anchor   
+                else:
+                    traj_mask = torch.ones_like(t_inds, dtype=torch.bool)
                 t_inds = torch.where(traj_mask, t_inds, torch.zeros_like(t_inds))
                 x_inds = torch.where(traj_mask, x_inds, torch.zeros_like(x_inds))
                 y_inds = torch.where(traj_mask, y_inds, torch.zeros_like(y_inds))
                 #############################################################
-
+    
                 
                 # for i in range(14):
                 #     print(f"--- tinds : {t_inds.shape}, {t_inds[i, 2886]}") # (15, 4096, 15)
@@ -682,37 +739,40 @@ def register_attention_control(model, controller, text_cond, clip_length, height
                 # print(f"--- traj_mask shape : {traj_mask.shape}")
                 keep_mask = seq_mask & traj_mask
                 mask = rearrange(torch.stack([keep_mask, keep_mask]),  'b f n l -> (b f) n l')
-
-                
+    
                 #############################################################
                 # mask = rearrange(torch.stack([mask, mask]),  'b f n l -> (b f) n l')
                 mask = mask[:,None].repeat(1, self.heads, 1, 1).unsqueeze(-2)
-
+    
                 
                 attn_bias = torch.zeros_like(mask, dtype=key_tempo.dtype) # regular zeros_like
                 attn_bias[~mask] = -torch.inf
-
+    
                 # print('attn_bias',attn_bias.shape)
+                print('query_tempo',query_tempo.shape) # query_tempo torch.Size([30, 4096, 1, 320])
+                print('key_tempo',key_tempo.shape)     # key_tempo torch.Size([30, 4096, 15, 320])
+                print('value_tempo',value_tempo.shape) # value_tempo torch.Size([30, 4096, 15, 320])
+                # flow attention
+                query_tempo = reshape_heads_to_batch_dim3(query_tempo) # query_tempo torch.Size([30, 8, 4096, 1, 40])
+                key_tempo = reshape_heads_to_batch_dim3(key_tempo)     # key_tempo torch.Size([30, 8, 4096, 15, 40])
+                value_tempo = reshape_heads_to_batch_dim3(value_tempo) # value_tempo torch.Size([30, 8, 4096, 15, 40])
+                # print("-------------------------------------------")
                 # print('query_tempo',query_tempo.shape)
                 # print('key_tempo',key_tempo.shape)
-
-                # flow attention
-                query_tempo = reshape_heads_to_batch_dim3(query_tempo)
-                key_tempo = reshape_heads_to_batch_dim3(key_tempo)
-                value_tempo = reshape_heads_to_batch_dim3(value_tempo)
-
+                # print('value_tempo',value_tempo.shape)
+                
                 attn_matrix2 = query_tempo @ key_tempo.transpose(-2, -1) / math.sqrt(query_tempo.size(-1)) + attn_bias
                 attn_matrix2 = F.softmax(attn_matrix2, dim=-1)
                 out = (attn_matrix2@value_tempo).squeeze(-2)
-
+    
                 hidden_states = rearrange(out,'(b f) k (h w) d -> b (f h w) (k d)', b=int(batch_size/clip_length), f=clip_length, h=h, w=w)
-
+    
             # linear proj
             hidden_states = self.to_out[0](hidden_states)
-
+    
             # dropout
             hidden_states = self.to_out[1](hidden_states)
-
+    
             # All frames
             hidden_states = rearrange(hidden_states, "b (f d) c -> (b f) d c", f=clip_length)
             return hidden_states
