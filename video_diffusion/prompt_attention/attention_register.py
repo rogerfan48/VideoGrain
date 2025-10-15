@@ -10,7 +10,8 @@ from video_diffusion.prompt_attention.flow_traj_attn import (
     normalize_traj_and_mask,
     reshape_heads_to_batch_dim3
 )
-from video_diffusion.prompt_attention.semantic_flow_attention_high_efficiency import semantic_flow_fullframe_sreg
+
+#from video_diffusion.prompt_attention.semantic_flow_attention_high_efficiency import semantic_flow_fullframe_sreg
 from einops import rearrange
 import torch
 import torch.nn.functional as F
@@ -439,7 +440,7 @@ def register_attention_control(model, controller, text_cond, clip_length, height
             h = kwargs['height']
             w = kwargs['width']
 
-            use_fullframe_layer = (h==64 and w==64)
+            use_fullframe_layer = (h==32 and w==32)
 
             if self.group_norm is not None:
                 # print("group norm") # no group norm
@@ -620,6 +621,8 @@ def register_attention_control(model, controller, text_cond, clip_length, height
                         use_sem_aug=getattr(self, "use_sem_aug", True),
                         flow_only=flow_only,
                         old_qk=kwargs.get("old_qk", 1),
+                        future_lookahead=1,          # 看 1 幀未來
+                        temporal_decay_tau=1.5   
                     )
     
                     # -------- Step 3: to_out 投影（與你原本一致） --------

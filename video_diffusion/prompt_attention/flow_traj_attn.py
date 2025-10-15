@@ -434,7 +434,7 @@ def normalize_traj_and_mask(traj, mask, F_clip, N):
 
     return traj, mask
 
-
+'''
 def flow_semantic_traj_attention(
     query_old, key_old, value_old,
     encoder_hidden_states, group_norm,
@@ -445,7 +445,21 @@ def flow_semantic_traj_attention(
     use_sem_aug=True,
     flow_only=False,
     old_qk=1
+):'''
+def flow_semantic_traj_attention(
+    query_old, key_old, value_old,
+    encoder_hidden_states, group_norm,
+    traj, mask, time_causal,
+    _key, _value,                 # [B, F, H, W, D]
+    h, w, clip_length, heads,     # spatial & heads
+    controller, sem_chunk=128,    # chunk for memory
+    use_sem_aug=True,
+    flow_only=False,
+    old_qk=1,
+    future_lookahead: int = 0,
+    temporal_decay_tau: float = 1.0
 ):
+
     """
     每個 query 既看：自己過去的軌跡（self-traj），也看同幀同語意像素及其各自的過去軌跡（same-class past-traj）。
     """
@@ -478,7 +492,7 @@ def flow_semantic_traj_attention(
     t_inds = traj[..., 0].long() #f,n l
     x_inds = traj[..., 1].long()
     y_inds = traj[..., 2].long()
-
+    '''
     # time-causal
     anchor = t_inds[:, :, 0].unsqueeze(-1).expand_as(t_inds)  # [F,N,L]
     if time_causal:
@@ -488,6 +502,27 @@ def flow_semantic_traj_attention(
     t_inds = torch.where(traj_mask, t_inds, torch.zeros_like(t_inds))
     x_inds = torch.where(traj_mask, x_inds, torch.zeros_like(x_inds))
     y_inds = torch.where(traj_mask, y_inds, torch.zeros_like(y_inds))
+    '''
+    
+        # time-causal（允許短未來視窗）
+    anchor = t_inds[:, :, 0].unsqueeze(-1).expand_as(t_inds)  # [F,N,L]
+    if time_causal:
+        upper = anchor + future_lookahead
+        traj_mask = t_inds <= upper
+    else:
+        traj_mask = torch.ones_like(t_inds, dtype=torch.bool)
+
+    # 越界時間索引改為 0（實際會被 mask 擋掉）
+    t_inds = torch.where(traj_mask, t_inds, torch.zeros_like(t_inds))
+    x_inds = torch.where(traj_mask, x_inds, torch.zeros_like(x_inds))
+    y_inds = torch.where(traj_mask, y_inds, torch.zeros_like(y_inds))
+
+    # 對「未來」點加時間衰減：dt = max(t - anchor, 0)
+    dt = (t_inds - anchor).clamp(min=0)
+    td_dtype = encoder_hidden_states.dtype
+    time_decay = torch.exp(- dt.to(td_dtype) / max(temporal_decay_tau, 1e-6))  # [F,N,L]
+
+
 
     # flat 位置 id：同幀語義去重用
     flat_traj = (t_inds * N + (x_inds * W + y_inds)).unsqueeze(0).expand(Bsmall, F_clip, N, -1)  # [B,F,N,L]
@@ -535,6 +570,7 @@ def flow_semantic_traj_attention(
         vt_h_f = vt_h[bf_idx]              # [B,H,N,L,d_h]
 
         # (1) self-traj
+        '''
         logits_traj = torch.matmul(q_h_f * scale, kt_h_f.transpose(-2, -1))  # [B,H,N,1,L]
         local_neg_inf = torch.finfo(acc_dtype).min
         bias_traj_f = torch.zeros_like(logits_traj, dtype=acc_dtype, device=device)
@@ -543,7 +579,23 @@ def flow_semantic_traj_attention(
             bias_traj_f,
             torch.full_like(bias_traj_f, local_neg_inf)
         )
+        logits_traj = logits_traj + bias_traj_f'''
+        logits_traj = torch.matmul(q_h_f * scale, kt_h_f.transpose(-2, -1))  # [B,H,N,1,L]
+
+        # + 時間衰減（未來項目）
+        td_f = time_decay[fcur].unsqueeze(0).unsqueeze(1).unsqueeze(3).expand(B, heads, N, 1, -1)
+        logits_traj = logits_traj + torch.log(td_f + 1e-12)
+
+        # 套 self-traj mask
+        local_neg_inf = torch.finfo(acc_dtype).min
+        bias_traj_f = torch.zeros_like(logits_traj, dtype=acc_dtype, device=device)
+        bias_traj_f = torch.where(
+            rearrange(attn_mask[bf_idx], 'b h n one l -> b h n one l'),
+            bias_traj_f,
+            torch.full_like(bias_traj_f, local_neg_inf)
+        )
         logits_traj = logits_traj + bias_traj_f
+
         m  = torch.max(logits_traj, dim=-1, keepdim=False).values    # [B,H,N,1]
         exp_logits = torch.exp(logits_traj - m.unsqueeze(-1))        # [B,H,N,1,L]
         Z   = exp_logits.sum(dim=-1)                                 # [B,H,N,1]
@@ -579,7 +631,18 @@ def flow_semantic_traj_attention(
                 Vc_flat = Vc.reshape(Bc, Hh, CL, Dh).unsqueeze(2)# [B,H,1,CL,d_h]
                 # Kc_flat = Kc.view(Bc, Hh, CL, Dh).unsqueeze(2)  
                 # Vc_flat = Vc.view(Bc, Hh, CL, Dh).unsqueeze(2)  
+                '''
                 logits_c = torch.matmul(q_h_f * scale, Kc_flat.transpose(-2, -1))  # [B,H,N,1,CL]  同語意的全部歷史長度注意力
+
+                mask_chunk_CL = mask_chunk.repeat_interleave(Ll, dim=-1)  # [B,H,N,1,CL]
+                neg_inf = torch.finfo(logits_c.dtype).min
+                logits_c = torch.where(mask_chunk_CL, logits_c, torch.full_like(logits_c, neg_inf))
+'''
+                logits_c = torch.matmul(q_h_f * scale, Kc_flat.transpose(-2, -1))  # [B,H,N,1,CL]
+
+                # 對同語意歷史加時間衰減
+                td_chunk = time_decay[fcur, s:e, :].reshape(1, 1, 1, 1, CL)  # [1,1,1,1,CL]
+                logits_c = logits_c + torch.log(td_chunk + 1e-12)
 
                 mask_chunk_CL = mask_chunk.repeat_interleave(Ll, dim=-1)  # [B,H,N,1,CL]
                 neg_inf = torch.finfo(logits_c.dtype).min
