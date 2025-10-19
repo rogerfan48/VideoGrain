@@ -703,3 +703,298 @@ def sample_trajectories_new(video_path, device,height,width):
         res["traj{}".format(resolution[0])] = seqs
         res["mask{}".format(resolution[0])] = masks
     return res
+
+
+@torch.no_grad()
+def sample_trajectories_cotracker(video_path, device, height, width, grid_size=None, use_online=False, low_memory=False, cotracker_device=None):
+    """
+    Sample trajectories using CoTracker3 for better occlusion handling.
+
+    CoTracker3 advantages over RAFT:
+    - Tracks points jointly, leveraging dependencies between tracks
+    - Handles occlusions by inferring positions of hidden points
+    - Maintains tracks even when points leave field of view
+    - Provides visibility predictions for each point
+
+    Args:
+        video_path (str): Path to the video file (MP4)
+        device (torch.device): CUDA device for computation
+        height (int): Video frame height
+        width (int): Video frame width
+        grid_size (int, optional): Grid size for point sampling. If None, auto-calculated based on resolution.
+        use_online (bool): If True, use online mode (memory efficient). If False, use offline mode (better accuracy).
+        low_memory (bool): If True, use aggressive memory optimization (lower resolution tracking).
+        cotracker_device (torch.device, optional): Separate GPU device for CoTracker. If None, use same as main device.
+
+    Returns:
+        dict: Dictionary containing trajectory and mask tensors for multiple resolutions
+            Format matches sample_trajectories_new output:
+            {
+                "traj64": torch.Tensor [T*H*W, sequence_length, 3],
+                "mask64": torch.Tensor [T*H*W, sequence_length],
+                "traj32": ...,
+                "mask32": ...,
+                etc.
+            }
+    """
+    import torchvision
+
+    # Determine which device to use for CoTracker
+    if cotracker_device is None:
+        cotracker_device = device
+    else:
+        print(f"Using separate GPU for CoTracker: {cotracker_device}")
+
+    # Read video frames
+    frames, _, _ = torchvision.io.read_video(str(video_path), output_format="TCHW")
+    T = frames.shape[0]
+
+    # Prepare video tensor: [1, T, C, H, W] (batch dimension required by CoTracker)
+    # Load to CoTracker's device (might be different from main device)
+    video = frames.unsqueeze(0).float()
+
+    # Define resolutions to process (matching original function)
+    resolutions = [
+        (height//8, width//8),    # 64x64 for 512x512 input
+        (height//16, width//16),  # 32x32
+        (height//32, width//32),  # 16x16
+        (height//64, width//64)   # 8x8
+    ]
+
+    window_sizes = {
+        (height//8, width//8): 2,
+        (height//16, width//16): 1,
+        (height//32, width//32): 1,
+        (height//64, width//64): 1
+    }
+
+    res = {}
+
+    # Load CoTracker model (use CoTracker3 for best occlusion handling)
+    print(f"Loading CoTracker3 model on {cotracker_device}...")
+
+    # Clear cache before loading to maximize available memory
+    torch.cuda.empty_cache()
+
+    if use_online:
+        cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_online").to(cotracker_device)
+        cotracker.eval()
+    else:
+        cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(cotracker_device)
+        cotracker.eval()
+
+    print(f"CoTracker model loaded successfully on {cotracker_device}")
+
+    for resolution in resolutions:
+        print("="*30)
+        print(f"Processing resolution: {resolution}")
+
+        H, W = resolution
+
+        # Calculate grid_size if not provided
+        # Grid size determines how densely we sample points
+        if grid_size is None:
+            # Auto-calculate to get good point density
+            # With separate GPU, we can afford denser tracking
+            auto_grid_size = max(H, W) // 8
+        else:
+            auto_grid_size = grid_size
+
+        # Adaptive resolution scaling
+        # With dedicated GPU, we can use high quality tracking
+        if low_memory:
+            # Memory saving mode
+            if H >= 64:
+                scale_factor = 4  # 64x64 -> 256x256
+            elif H >= 32:
+                scale_factor = 4  # 32x32 -> 128x128
+            elif H >= 16:
+                scale_factor = 4  # 16x16 -> 64x64
+            else:
+                scale_factor = 4  # 8x8 -> 32x32
+        else:
+            # High quality mode (when using separate GPU, we can afford this)
+            if H >= 64:
+                scale_factor = 8  # 64x64 -> 512x512 (full resolution)
+            elif H >= 32:
+                scale_factor = 8  # 32x32 -> 256x256
+            elif H >= 16:
+                scale_factor = 8  # 16x16 -> 128x128
+            else:
+                scale_factor = 8  # 8x8 -> 64x64
+
+        # Calculate target size (must be integers)
+        target_h = int(H * scale_factor)
+        target_w = int(W * scale_factor)
+
+        # Resize video to current resolution for tracking
+        # Move to CoTracker's device
+        video_resized = torch.nn.functional.interpolate(
+            video.reshape(T, 3, height, width),
+            size=(target_h, target_w),
+            mode='bilinear',
+            align_corners=False
+        ).unsqueeze(0).to(cotracker_device)  # [1, T, C, H*scale, W*scale] on CoTracker device
+
+        # Run CoTracker to get trajectories
+        if use_online:
+            # Online mode: process in sliding windows
+            cotracker(video_chunk=video_resized, is_first_step=True, grid_size=auto_grid_size)
+            pred_tracks_list = []
+            pred_visibility_list = []
+
+            for ind in range(0, video_resized.shape[1] - cotracker.step, cotracker.step):
+                tracks, visibility = cotracker(
+                    video_chunk=video_resized[:, ind : ind + cotracker.step * 2]
+                )
+                pred_tracks_list.append(tracks)
+                pred_visibility_list.append(visibility)
+
+            # Concatenate results
+            pred_tracks = torch.cat(pred_tracks_list, dim=1)  # [1, T, N, 2]
+            pred_visibility = torch.cat(pred_visibility_list, dim=1)  # [1, T, N]
+        else:
+            # Offline mode: process entire video at once (better for occlusion handling)
+            pred_tracks, pred_visibility = cotracker(video_resized, grid_size=auto_grid_size)
+            # pred_tracks: [1, T, N, 2] where N is number of tracked points
+            # pred_visibility: [1, T, N] (1 if visible, 0 if occluded)
+
+        # Remove batch dimension carefully to handle N=1 case
+        pred_tracks = pred_tracks[0]  # [T, N, 2] - use indexing instead of squeeze
+        # CoTracker3 returns visibility as [B, T, N] not [B, T, N, 1]
+        pred_visibility = pred_visibility[0]  # [T, N] - explicit indexing
+
+        N = pred_tracks.shape[1]  # Number of tracked points
+
+        print(f"CoTracker tracked {N} points across {T} frames")
+        print(f"Visibility ratio: {pred_visibility.float().mean().item():.2%}")
+
+        # Convert CoTracker tracks to trajectory format
+        # pred_tracks are in (x, y) format, need to convert to grid coordinates
+        # Scale tracks from (H*scale_factor, W*scale_factor) space to (H, W) grid
+        tracks_scaled = pred_tracks / float(scale_factor)
+        tracks_scaled = torch.round(tracks_scaled).long()
+
+        # Build point-to-trajectory mapping
+        # Each tracked point forms a trajectory across time
+        point_trajectories = {}
+
+        for point_idx in range(N):
+            trajectory = []
+            for t in range(T):
+                if pred_visibility[t, point_idx] > 0.5:  # Point is visible
+                    y, x = tracks_scaled[t, point_idx]  # CoTracker outputs (x, y)
+                    x, y = y.item(), x.item()  # Swap to (y, x) and convert to int
+
+                    # Clamp to valid range
+                    x = max(0, min(H-1, x))
+                    y = max(0, min(W-1, y))
+
+                    trajectory.append((t, x, y))
+
+            if len(trajectory) > 0:
+                # Store trajectory indexed by first point
+                first_point = trajectory[0]
+                point_trajectories[first_point] = trajectory
+
+        print(f"Created {len(point_trajectories)} valid trajectories")
+
+        # Build sequences for each spatial-temporal location
+        # This matches the output format of sample_trajectories_new
+        all_points = set([(t, x, y) for t in range(T) for x in range(H) for y in range(W)])
+        tracked_points = set()
+        for traj in point_trajectories.values():
+            tracked_points.update(traj)
+
+        # For points not tracked, create singleton trajectories
+        untracked_points = all_points - tracked_points
+        for point in untracked_points:
+            point_trajectories[point] = [point]
+
+        print(f"Total points covered: {len(all_points)}")
+        print(f"Tracked points: {len(tracked_points)}")
+        print(f"Untracked points: {len(untracked_points)}")
+
+        # Create point-to-trajectory lookup
+        point_to_traj = {}
+        for traj in point_trajectories.values():
+            for p in traj:
+                point_to_traj[p] = traj
+
+        # Calculate sequence length
+        # IMPORTANT: Match RAFT's behavior - longest_length should be T (clip_length)
+        # RAFT's longest trajectory is T frames, so sequence_length = spatial + T - 1
+        # This ensures flow attention gets correct temporal indices
+        longest_length = T  # Force to match RAFT
+        sequence_length = (window_sizes[resolution]*2+1)**2 + longest_length - 1
+
+        seqs = []
+        masks = []
+
+        # Build sequences for each point (matching original format)
+        for t in range(T):
+            for x in range(H):
+                for y in range(W):
+                    # Get spatial neighbors
+                    neighbours = neighbors_index((t,x,y), window_sizes[resolution], H, W)
+
+                    # Build spatial part of sequence
+                    sequence = [(t,x,y)] + neighbours + [(0,0,0) for i in range((window_sizes[resolution]*2+1)**2-1-len(neighbours))]
+                    sequence_mask = torch.zeros(sequence_length, dtype=torch.bool)
+                    sequence_mask[:len(neighbours)+1] = True
+
+                    # Build temporal part of sequence (trajectory)
+                    if (t,x,y) in point_to_traj:
+                        traj = point_to_traj[(t,x,y)].copy()
+                        traj.remove((t,x,y))
+                    else:
+                        traj = []
+
+                    # Add trajectory to sequence
+                    sequence = sequence + traj + [(0,0,0) for k in range(longest_length-1-len(traj))]
+                    sequence_mask[(window_sizes[resolution]*2+1)**2: (window_sizes[resolution]*2+1)**2 + len(traj)] = True
+
+                    seqs.append(sequence)
+                    masks.append(sequence_mask)
+
+        # Convert to tensors on CPU first, matching RAFT behavior
+        # PyTorch will automatically move to GPU when needed, which may have better memory management
+        seqs = torch.tensor(seqs)
+        masks = torch.stack(masks)
+
+        # Store in result dict (already on main device)
+        res["traj{}".format(resolution[0])] = seqs
+        res["mask{}".format(resolution[0])] = masks
+
+        print(f"Resolution {resolution} completed: {seqs.shape[0]} sequences of length {sequence_length}")
+
+        # Aggressive memory cleanup after each resolution
+        del pred_tracks, pred_visibility, tracks_scaled, point_trajectories
+        del seqs, masks, video_resized, point_to_traj
+
+        # Clear GPU cache on CoTracker's device
+        if torch.cuda.is_available():
+            with torch.cuda.device(cotracker_device):
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+    # CRITICAL: Explicitly delete CoTracker model and free all GPU memory
+    print("\n" + "="*30)
+    print("Cleaning up CoTracker model to free GPU memory...")
+    del cotracker
+    del video
+    torch.cuda.empty_cache()
+
+    # Force garbage collection
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # Report memory freed
+    if torch.cuda.is_available():
+        memory_allocated = torch.cuda.memory_allocated(cotracker_device) / 1024**3
+        memory_reserved = torch.cuda.memory_reserved(cotracker_device) / 1024**3
+        print(f"GPU memory after cleanup: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
+    print("="*30 + "\n")
+
+    return res

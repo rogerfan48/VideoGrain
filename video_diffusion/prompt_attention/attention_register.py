@@ -457,8 +457,16 @@ def register_attention_control(model, controller, text_cond, clip_length, height
                 value = hidden_states
 
                 traj = kwargs["traj"]
+                mask = kwargs["mask"]
+
+                # Move to device only if needed (in-place to save memory)
+                if traj.device != query.device:
+                    traj = traj.to(query.device, non_blocking=True)
+                if mask.device != query.device:
+                    mask = mask.to(query.device, non_blocking=True)
+
                 traj = rearrange(traj, '(f n) l d -> f n l d', f=clip_length, n=sequence_length)
-                mask = rearrange(kwargs["mask"], '(f n) l -> f n l', f=clip_length, n=sequence_length)
+                mask = rearrange(mask, '(f n) l -> f n l', f=clip_length, n=sequence_length)
                 mask = torch.cat([mask[:, :, 0].unsqueeze(-1), mask[:, :, -clip_length+1:]], dim=-1)
 
                 #print('traj',traj.shape)

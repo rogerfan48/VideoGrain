@@ -27,7 +27,7 @@ from video_diffusion.models.unet_3d_condition import UNetPseudo3DConditionModel
 from video_diffusion.data.dataset import ImageSequenceDataset
 from video_diffusion.common.util import get_time_string, get_function_args
 from video_diffusion.common.logger import get_logger_config_path
-from video_diffusion.common.image_util import log_train_samples,log_infer_samples,save_tensor_images_and_video,visualize_check_downsample_keypoints,sample_trajectories,save_videos_grid,sample_trajectories_new
+from video_diffusion.common.image_util import log_train_samples,log_infer_samples,save_tensor_images_and_video,visualize_check_downsample_keypoints,sample_trajectories,save_videos_grid,sample_trajectories_new,sample_trajectories_cotracker
 from video_diffusion.common.instantiate_from_config import instantiate_from_config
 from video_diffusion.pipelines.validation_loop import SampleLogger
 
@@ -146,11 +146,31 @@ def test(
     if is_xformers_available():
         try:
             pipeline.enable_xformers_memory_efficient_attention()
+            # CRITICAL: Also enable xformers for ControlNet to avoid OOM
+            # Without this, ControlNet attention will try to allocate 15GB for 30 frames!
+            controlnet.set_use_memory_efficient_attention_xformers(True)
+            print("✅ Enabled xformers for both UNet and ControlNet")
         except Exception as e:
             logger.warning(
                 "Could not enable memory efficient attention. Make sure xformers is installed"
                 f" correctly and a GPU is available: {e}"
             )
+    else:
+        # FALLBACK: If xformers not available, use sliced attention to avoid OOM
+        # This is slower but avoids the 15GB attention matrix allocation
+        print("⚠️  xformers not available, enabling sliced attention for ControlNet")
+        print("    This will be slower but avoid OOM. Consider installing xformers:")
+        print("    pip install xformers==0.0.27")
+
+        # Enable sliced attention for all CrossAttention modules in ControlNet
+        def enable_sliced_attention_recursive(module, slice_size=1):
+            """Recursively enable sliced attention for all attention modules"""
+            for name, submodule in module.named_modules():
+                if hasattr(submodule, 'set_attention_slice'):
+                    submodule.set_attention_slice(slice_size)
+
+        enable_sliced_attention_recursive(controlnet, slice_size=1)
+        print(f"✅ Enabled sliced attention (slice_size=1) for ControlNet")
 
     vae.requires_grad_(False)
     unet.requires_grad_(False)
@@ -282,15 +302,73 @@ def test(
 
     control_save_dir = os.path.join(logdir, "control")
 
-    save_tensor_images_and_video(control_save, control_save_dir) 
+    save_tensor_images_and_video(control_save, control_save_dir)
 
     # compute optical flows and sample trajectories
-    trajectories = sample_trajectories_new(os.path.join(logdir, "source_video.mp4"),accelerator.device,height,width)
+    # Choose tracker based on editing_config
+    use_cotracker = editing_config.get('use_cotracker', False)
+    cotracker_online = editing_config.get('cotracker_online', False)
+    cotracker_grid_size = editing_config.get('cotracker_grid_size', None)
+    cotracker_low_memory = editing_config.get('cotracker_low_memory', False)
+    cotracker_gpu_id = editing_config.get('cotracker_gpu_id', None)
+
+    if use_cotracker:
+        print("Using CoTracker3 for trajectory tracking (better occlusion handling)...")
+        if cotracker_low_memory:
+            print("  ⚠️  Low memory mode enabled - using lower resolution tracking")
+
+        # Determine device for CoTracker
+        cotracker_device = None
+        if cotracker_gpu_id is not None:
+            num_gpus = torch.cuda.device_count()
+            if cotracker_gpu_id < num_gpus:
+                cotracker_device = torch.device(f"cuda:{cotracker_gpu_id}")
+                print(f"  🔄 Running CoTracker on separate GPU: cuda:{cotracker_gpu_id}")
+            else:
+                print(f"  ⚠️  Warning: cotracker_gpu_id={cotracker_gpu_id} invalid (only {num_gpus} GPUs available), using main device")
+
+        trajectories = sample_trajectories_cotracker(
+            os.path.join(logdir, "source_video.mp4"),
+            accelerator.device,
+            height,
+            width,
+            grid_size=cotracker_grid_size,
+            use_online=cotracker_online,
+            low_memory=cotracker_low_memory,
+            cotracker_device=cotracker_device
+        )
+    else:
+        print("Using RAFT-based trajectory tracking...")
+        trajectories = sample_trajectories_new(
+            os.path.join(logdir, "source_video.mp4"),
+            accelerator.device,
+            height,
+            width
+        )
 
     torch.cuda.empty_cache()
 
+    # Report GPU memory status before main pipeline
+    if torch.cuda.is_available():
+        memory_allocated = torch.cuda.memory_allocated(accelerator.device) / 1024**3
+        memory_reserved = torch.cuda.memory_reserved(accelerator.device) / 1024**3
+        memory_free = (torch.cuda.get_device_properties(accelerator.device).total_memory - torch.cuda.memory_reserved(accelerator.device)) / 1024**3
+        print(f"\n{'='*50}")
+        print(f"GPU Memory Status Before Main Pipeline:")
+        print(f"  Allocated: {memory_allocated:.2f} GB")
+        print(f"  Reserved:  {memory_reserved:.2f} GB")
+        print(f"  Free:      {memory_free:.2f} GB")
+        print(f"{'='*50}\n")
+
+    # Trajectories are already on accelerator.device (moved directly from CoTracker result)
+    # No need to move again - this was causing extra memory usage!
+
+    # Report trajectory sizes for debugging
+    total_traj_size = sum([trajectories[k].element_size() * trajectories[k].nelement() for k in trajectories.keys()]) / 1024**3
+    print(f"Total trajectories size: {total_traj_size:.2f} GB")
     for k in trajectories.keys():
-        trajectories[k] = trajectories[k].to(accelerator.device)
+        traj_size = trajectories[k].element_size() * trajectories[k].nelement() / 1024**3
+        print(f"  {k}: {trajectories[k].shape} = {traj_size:.2f} GB")
 
     downsample_height, downsample_width = height//8, width//8
     # The externally specified flatten_res
