@@ -135,7 +135,39 @@ editing_config:
 
   # GPU assignment (null = same as main, 1 = use GPU 1)
   cotracker_gpu_id: 1
+
+  # Visualization (optional): Generate trajectory visualization video
+  visualize_cotracker_flow: true  # Creates logdir/sample/flow_visualization.mp4
 ```
+
+**Trajectory Visualization:**
+
+Enable trajectory visualization to debug and verify CoTracker's tracking quality:
+
+```yaml
+editing_config:
+  use_cotracker: true
+  visualize_cotracker_flow: true  # Enable visualization
+```
+
+**What you'll see:**
+- **64 tracked points** (8×8 grid) covering the entire frame including edges
+- **Color-coded by position**: Red (left) → Orange → Yellow → Green → Cyan → Blue (right)
+- **Trajectory trails**: Show point movement from frame 0 to current frame
+  - Solid lines (bright): Visible trajectories (high confidence)
+  - Dashed lines (faded): Invisible trajectories (low confidence, e.g., occluded)
+  - Line thickness increases over time (older = thin, recent = thick)
+- **Current positions**: Circles with darker outline for better visibility
+
+**Output:** `{logdir}/sample/flow_visualization.mp4`
+
+**Use cases:**
+- Verify tracking quality through occlusions
+- Debug why editing fails in certain frames
+- Understand which points CoTracker considers "visible" vs "invisible"
+- Check if trajectory discontinuities affect your edit
+
+**Visibility threshold:** The system uses `visibility > 0.1` to accept trajectory points. CoTracker marks points as "invisible" when occluded, blurred, or leaving the frame - these still get tracked but with lower confidence.
 
 See [1019-cotracker.md](1019-cotracker.md) for detailed comparison and technical details.
 
@@ -173,6 +205,7 @@ editing_config:
   # Trajectory tracking (choose one)
   use_cotracker: false                  # true for CoTracker, false for RAFT
   cotracker_gpu_id: 1                   # GPU for CoTracker (if enabled)
+  visualize_cotracker_flow: false       # true to generate trajectory visualization
 
   # Editing prompts
   editing_prompts:
@@ -193,6 +226,12 @@ editing_config:
 - **use_cotracker**: Trajectory tracking method
   - `false` or omitted: Use RAFT (faster)
   - `true`: Use CoTracker3 (better quality)
+
+- **visualize_cotracker_flow**: Generate trajectory visualization (only works when `use_cotracker: true`)
+  - `false` or omitted: No visualization (default)
+  - `true`: Generate `{logdir}/sample/flow_visualization.mp4`
+  - Shows 64 tracked points (8×8 grid) with color-coded trajectories
+  - Useful for debugging tracking issues and understanding visibility
 
 ## Data Preparation
 

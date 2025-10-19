@@ -42,6 +42,9 @@ editing_config:
   # GPU 0: Main diffusion model
   # GPU 1: CoTracker trajectory tracking
   cotracker_gpu_id: 1
+  # Visualization: Generate a video showing trajectory tracking
+  # Set to true to create flow_visualization.mp4 in logdir/sample/
+  visualize_cotracker_flow: true
 
   editing_prompts:
     [

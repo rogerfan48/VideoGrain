@@ -705,8 +705,282 @@ def sample_trajectories_new(video_path, device,height,width):
     return res
 
 
+def draw_dashed_line(img, pt1, pt2, color, thickness=1, dash_length=5):
+    """Draw a dashed line on the image."""
+    import cv2
+    import numpy as np
+
+    x1, y1 = pt1
+    x2, y2 = pt2
+
+    # Calculate line length and direction
+    dist = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+    if dist == 0:
+        return
+
+    # Number of dashes
+    num_dashes = int(dist / (dash_length * 2))
+    if num_dashes == 0:
+        cv2.line(img, pt1, pt2, color, thickness)
+        return
+
+    # Draw dashed line
+    for i in range(num_dashes):
+        start_ratio = (i * 2 * dash_length) / dist
+        end_ratio = min(((i * 2 + 1) * dash_length) / dist, 1.0)
+
+        start_x = int(x1 + (x2 - x1) * start_ratio)
+        start_y = int(y1 + (y2 - y1) * start_ratio)
+        end_x = int(x1 + (x2 - x1) * end_ratio)
+        end_y = int(y1 + (y2 - y1) * end_ratio)
+
+        cv2.line(img, (start_x, start_y), (end_x, end_y), color, thickness)
+
+
+def _visualize_cotracker_flow(video_path, tracks, visibility, scale_factor, logdir, visibility_threshold=0.5):
+    """
+    Visualize CoTracker trajectories on the original video.
+
+    Args:
+        video_path (str): Path to input video
+        tracks (torch.Tensor): Tracked points [T, N, 2] in (x, y) format
+        visibility (torch.Tensor): Visibility mask [T, N]
+        scale_factor (float): Scale factor used during tracking
+        logdir (str): Output directory
+        visibility_threshold (float): Threshold for solid vs dashed lines (default: 0.5)
+    """
+    import cv2
+    import numpy as np
+    import os
+    import torch
+
+    print("\n" + "="*30)
+    print("Generating flow visualization...")
+
+    # Read video
+    import torchvision
+    frames, _, info = torchvision.io.read_video(str(video_path), output_format="TCHW")
+    T, C, H, W = frames.shape
+
+    # Convert to numpy arrays for drawing (T, H, W, C) in RGB
+    frames_np = frames.permute(0, 2, 3, 1).numpy().astype(np.uint8)
+
+    # Create an 8x8 grid of points uniformly distributed across the frame
+    # Including edge points
+    grid_h = 8  # rows
+    grid_w = 8  # columns
+
+    # Calculate grid positions (evenly spaced, including edges)
+    # Use grid_h-1 to get positions from edge to edge
+    margin_h = H // (grid_h - 1) if grid_h > 1 else 0
+    margin_w = W // (grid_w - 1) if grid_w > 1 else 0
+
+    grid_points = []  # Will store (grid_y, grid_x, point_idx) for each grid position
+    grid_colors = []  # Color for each grid point
+
+    print(f"Creating {grid_w}x{grid_h} grid of visualization points")
+
+    # Generate grid points and assign colors
+    for row in range(grid_h):
+        for col in range(grid_w):
+            # Calculate position in frame (evenly distributed, including edges)
+            # For 8x8 grid on 512x512: positions are 0, 73, 146, 219, 292, 365, 438, 511
+            grid_y = margin_h * row
+            grid_x = margin_w * col
+
+            # Find nearest tracked point at t=0
+            # tracks is [T, N, 2] where 2 = (x, y)
+            # tracks are already in the original video resolution (H x W)
+            # because CoTracker was run on video_resized which has size (target_h, target_w) = (H*scale, W*scale) = (H, W) for original video
+            initial_tracks = tracks[0].numpy()  # [N, 2] in video resolution space
+
+            # Grid position is already in video space (0 to H-1, 0 to W-1)
+            # No scaling needed since tracks are also in the same space
+            track_x = grid_x
+            track_y = grid_y
+
+            # Find nearest point
+            distances = np.sqrt((initial_tracks[:, 0] - track_x)**2 +
+                              (initial_tracks[:, 1] - track_y)**2)
+            nearest_idx = np.argmin(distances)
+
+            grid_points.append((grid_y, grid_x, nearest_idx))
+
+            # Generate saturated color based on position
+            # Hue varies across the grid: left=red (0°), right=blue (240°)
+            hue = int(240 * col / max(1, grid_w - 1))  # 0 to 240
+
+            # Convert HSV to RGB (S=255, V=255 for saturated colors)
+            import colorsys
+            rgb = colorsys.hsv_to_rgb(hue / 360.0, 1.0, 1.0)
+            color = (int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255))
+            grid_colors.append(color)
+
+    num_points = len(grid_points)
+    print(f"Grid points mapped to {num_points} tracked trajectories")
+
+    # Debug: Print some sample grid points and their mappings
+    print(f"Sample grid points (first 3):")
+    for i in range(min(3, num_points)):
+        grid_y, grid_x, track_idx = grid_points[i]
+        print(f"  Grid point {i}: pos=({grid_x}, {grid_y}), mapped to track_idx={track_idx}, color={grid_colors[i]}")
+
+    # Debug: Print track info
+    print(f"Tracks shape: {tracks.shape}, range: x=[{tracks[:,:,0].min():.1f}, {tracks[:,:,0].max():.1f}], y=[{tracks[:,:,1].min():.1f}, {tracks[:,:,1].max():.1f}]")
+    print(f"Video resolution: {H}x{W}, scale_factor: {scale_factor}")
+
+    # Prepare output directory
+    output_dir = os.path.join(logdir, "sample")
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "flow_visualization.mp4")
+
+    # Pre-compute full trajectories for all grid points (from frame 0 to T-1)
+    full_trajectories = []
+    full_trajectories_with_invisible = []  # Also track invisible points for debugging
+
+    for grid_idx in range(num_points):
+        grid_y, grid_x, track_idx = grid_points[grid_idx]
+
+        # Build complete trajectory from frame 0 to T-1
+        trajectory = []
+        trajectory_all = []  # Include invisible points
+
+        for t in range(T):
+            track_pos = tracks[t, track_idx].numpy()  # [2] = [x, y]
+            x = int(track_pos[0])
+            y = int(track_pos[1])
+
+            # Clamp to valid range
+            x = max(0, min(W-1, x))
+            y = max(0, min(H-1, y))
+
+            vis = visibility[t, track_idx].item()
+            trajectory_all.append((t, x, y, vis))  # Store with visibility
+
+            if vis > visibility_threshold:  # Only add visible points to main trajectory
+                trajectory.append((t, x, y))
+
+        full_trajectories.append(trajectory)
+        full_trajectories_with_invisible.append(trajectory_all)
+
+        # Debug: Print first few points with visibility info
+        if grid_idx < 3:
+            visible_count = sum(1 for (_, _, _, v) in trajectory_all if v > visibility_threshold)
+            invisible_count = T - visible_count
+            print(f"  Grid {grid_idx}: track_idx={track_idx}")
+            print(f"    Visible frames: {visible_count}/{T}, Invisible: {invisible_count}")
+            if len(trajectory) > 0:
+                print(f"    First visible pos: {trajectory[0]}, Last visible pos: {trajectory[-1]}")
+            # Show visibility pattern
+            vis_pattern = ''.join(['█' if v > visibility_threshold else '·' for (_, _, _, v) in trajectory_all])
+            print(f"    Visibility pattern: {vis_pattern}")
+
+    print(f"\nPre-computed {len(full_trajectories)} trajectories")
+
+    # Summary statistics
+    avg_visible = sum(len(traj) for traj in full_trajectories) / len(full_trajectories)
+    print(f"Average visible frames per point: {avg_visible:.1f}/{T}")
+
+    # Draw trajectories on each frame
+    output_frames = []
+    show_invisible_tracks = True  # Set to True to show invisible tracks as dashed lines
+
+    for current_t in range(T):
+        frame = frames_np[current_t].copy()  # RGB format
+
+        # Convert to BGR for OpenCV drawing
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        # Draw accumulated trajectories up to current frame
+        for grid_idx in range(num_points):
+            color_rgb = grid_colors[grid_idx]
+            color_bgr = (color_rgb[2], color_rgb[1], color_rgb[0])  # RGB to BGR
+            color_bgr_faded = tuple(int(c * 0.4) for c in color_bgr)  # Faded color for invisible
+
+            trajectory = full_trajectories[grid_idx]
+            trajectory_all = full_trajectories_with_invisible[grid_idx]
+
+            # Filter trajectory points up to current frame
+            points_so_far = [(x, y) for (t, x, y) in trajectory if t <= current_t]
+
+            if show_invisible_tracks:
+                # Also draw invisible points with faded color
+                all_points_so_far = [(x, y, vis) for (t, x, y, vis) in trajectory_all if t <= current_t]
+
+                if len(all_points_so_far) > 1:
+                    # Draw all segments, using faded color for invisible parts
+                    for i in range(len(all_points_so_far) - 1):
+                        x1, y1, vis1 = all_points_so_far[i]
+                        x2, y2, vis2 = all_points_so_far[i+1]
+
+                        # Choose color based on visibility (using the same threshold as VideoGrain)
+                        if vis1 > visibility_threshold and vis2 > visibility_threshold:
+                            # Both visible: solid line with gradient thickness
+                            alpha = (i + 1) / len(all_points_so_far)
+                            thickness = max(2, int(4 * alpha))  # Thicker lines: 2-4
+                            cv2.line(frame_bgr, (x1, y1), (x2, y2), color_bgr, thickness)
+                        else:
+                            # At least one invisible: thinner dashed line
+                            draw_dashed_line(frame_bgr, (x1, y1), (x2, y2), color_bgr_faded, 1, dash_length=4)
+
+                # Draw current point
+                if len(all_points_so_far) > 0:
+                    current_x, current_y, current_vis = all_points_so_far[-1]
+                    if current_vis > visibility_threshold:
+                        # Visible: larger filled circle with darker outline for better contrast
+                        cv2.circle(frame_bgr, (current_x, current_y), 6, color_bgr, -1)  # Filled circle
+                        # Add subtle darker outline (same color but darker)
+                        outline_color = tuple(int(c * 0.6) for c in color_bgr)
+                        cv2.circle(frame_bgr, (current_x, current_y), 7, outline_color, 1)
+                    else:
+                        # Invisible: smaller faded circle
+                        cv2.circle(frame_bgr, (current_x, current_y), 3, color_bgr_faded, -1)
+
+            else:
+                # Original behavior: only show visible points
+                if len(points_so_far) == 0:
+                    continue
+
+                # Draw trajectory trail (all points from frame 0 to current_t)
+                if len(points_so_far) > 1:
+                    # Draw all segments with gradient thickness
+                    for i in range(len(points_so_far) - 1):
+                        # Fading effect: older points are thinner
+                        alpha = (i + 1) / len(points_so_far)
+                        thickness = max(2, int(4 * alpha))  # Thicker lines: 2-4
+                        cv2.line(frame_bgr, points_so_far[i], points_so_far[i+1], color_bgr, thickness)
+
+                # Draw current point (the latest visible position)
+                current_x, current_y = points_so_far[-1]
+                cv2.circle(frame_bgr, (current_x, current_y), 6, color_bgr, -1)  # Filled circle
+                # Add subtle darker outline
+                outline_color = tuple(int(c * 0.6) for c in color_bgr)
+                cv2.circle(frame_bgr, (current_x, current_y), 7, outline_color, 1)
+
+        # Convert back to RGB
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        output_frames.append(frame_rgb)
+
+    # Convert to torch tensor and save using torchvision
+    output_frames_tensor = torch.from_numpy(np.stack(output_frames))  # [T, H, W, C]
+    output_frames_tensor = output_frames_tensor.permute(0, 3, 1, 2)  # [T, C, H, W]
+
+    # Save using torchvision with the same encoding as other videos
+    fps = info['video_fps'] if 'video_fps' in info else 30.0
+    torchvision.io.write_video(
+        output_path,
+        output_frames_tensor.permute(0, 2, 3, 1),  # [T, H, W, C] for write_video
+        fps=fps,
+        video_codec='h264',
+        options={'crf': '18'}  # High quality
+    )
+
+    print(f"✅ Flow visualization saved to: {output_path}")
+    print("="*30 + "\n")
+
+
 @torch.no_grad()
-def sample_trajectories_cotracker(video_path, device, height, width, grid_size=None, use_online=False, low_memory=False, cotracker_device=None):
+def sample_trajectories_cotracker(video_path, device, height, width, grid_size=None, use_online=False, low_memory=False, cotracker_device=None, visualize_flow=False, logdir=None):
     """
     Sample trajectories using CoTracker3 for better occlusion handling.
 
@@ -725,6 +999,8 @@ def sample_trajectories_cotracker(video_path, device, height, width, grid_size=N
         use_online (bool): If True, use online mode (memory efficient). If False, use offline mode (better accuracy).
         low_memory (bool): If True, use aggressive memory optimization (lower resolution tracking).
         cotracker_device (torch.device, optional): Separate GPU device for CoTracker. If None, use same as main device.
+        visualize_flow (bool): If True, generate a visualization video showing tracked trajectories.
+        logdir (str, optional): Output directory for visualization. Required if visualize_flow is True.
 
     Returns:
         dict: Dictionary containing trajectory and mask tensors for multiple resolutions
@@ -784,6 +1060,10 @@ def sample_trajectories_cotracker(video_path, device, height, width, grid_size=N
         cotracker.eval()
 
     print(f"CoTracker model loaded successfully on {cotracker_device}")
+
+    # Store tracks for visualization (only need highest resolution)
+    visualization_tracks = None
+    visualization_visibility = None
 
     for resolution in resolutions:
         print("="*30)
@@ -869,6 +1149,12 @@ def sample_trajectories_cotracker(video_path, device, height, width, grid_size=N
         print(f"CoTracker tracked {N} points across {T} frames")
         print(f"Visibility ratio: {pred_visibility.float().mean().item():.2%}")
 
+        # Store tracks for visualization (only from highest resolution)
+        if visualize_flow and visualization_tracks is None and resolution == resolutions[0]:
+            visualization_tracks = pred_tracks.cpu()  # [T, N, 2]
+            visualization_visibility = pred_visibility.cpu()  # [T, N]
+            visualization_scale = scale_factor  # Remember the scale factor for drawing
+
         # Convert CoTracker tracks to trajectory format
         # pred_tracks are in (x, y) format, need to convert to grid coordinates
         # Scale tracks from (H*scale_factor, W*scale_factor) space to (H, W) grid
@@ -879,10 +1165,15 @@ def sample_trajectories_cotracker(video_path, device, height, width, grid_size=N
         # Each tracked point forms a trajectory across time
         point_trajectories = {}
 
+        # Visibility threshold for accepting trajectory points
+        # Lower threshold = more permissive (accept more "uncertain" points)
+        # Higher threshold = more strict (only accept confident points)
+        visibility_threshold = 0.3  # Changed from 0.5 to be more permissive
+
         for point_idx in range(N):
             trajectory = []
             for t in range(T):
-                if pred_visibility[t, point_idx] > 0.5:  # Point is visible
+                if pred_visibility[t, point_idx] > visibility_threshold:  # Point is visible enough
                     y, x = tracks_scaled[t, point_idx]  # CoTracker outputs (x, y)
                     x, y = y.item(), x.item()  # Swap to (y, x) and convert to int
 
@@ -996,5 +1287,16 @@ def sample_trajectories_cotracker(video_path, device, height, width, grid_size=N
         memory_reserved = torch.cuda.memory_reserved(cotracker_device) / 1024**3
         print(f"GPU memory after cleanup: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
     print("="*30 + "\n")
+
+    # Generate visualization if requested
+    if visualize_flow and visualization_tracks is not None and logdir is not None:
+        _visualize_cotracker_flow(
+            video_path,
+            visualization_tracks,
+            visualization_visibility,
+            visualization_scale,
+            logdir,
+            visibility_threshold  # Pass the threshold used by VideoGrain
+        )
 
     return res

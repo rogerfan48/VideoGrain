@@ -311,6 +311,7 @@ def test(
     cotracker_grid_size = editing_config.get('cotracker_grid_size', None)
     cotracker_low_memory = editing_config.get('cotracker_low_memory', False)
     cotracker_gpu_id = editing_config.get('cotracker_gpu_id', None)
+    visualize_cotracker_flow = editing_config.get('visualize_cotracker_flow', False)
 
     if use_cotracker:
         print("Using CoTracker3 for trajectory tracking (better occlusion handling)...")
@@ -335,7 +336,9 @@ def test(
             grid_size=cotracker_grid_size,
             use_online=cotracker_online,
             low_memory=cotracker_low_memory,
-            cotracker_device=cotracker_device
+            cotracker_device=cotracker_device,
+            visualize_flow=visualize_cotracker_flow,
+            logdir=logdir
         )
     else:
         print("Using RAFT-based trajectory tracking...")
