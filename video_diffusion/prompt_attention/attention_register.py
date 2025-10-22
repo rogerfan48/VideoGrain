@@ -6,7 +6,7 @@ Most of spatial_temporal_forward is directly copy from `video_diffusion/models/a
 TODO FIXME: merge redundant code with attention.py
 """
 from video_diffusion.prompt_attention.flow_traj_attn import (
-    flow_semantic_traj_attention,
+    flow_traj_attn_bidir_window,
     normalize_traj_and_mask,
     reshape_heads_to_batch_dim3
 )
@@ -603,7 +603,7 @@ def register_attention_control(model, controller, text_cond, clip_length, height
                     else:
                         flow_only=True
                         
-                    hidden_states_ff =  flow_semantic_traj_attention(
+                    hidden_states_ff =  flow_traj_attn_bidir_window(
                         query_old=query_old_ff,
                         key_old=key_old_ff,
                         value_old=value_old_ff,
@@ -621,8 +621,7 @@ def register_attention_control(model, controller, text_cond, clip_length, height
                         use_sem_aug=getattr(self, "use_sem_aug", True),
                         flow_only=flow_only,
                         old_qk=kwargs.get("old_qk", 1),
-                        future_lookahead=1,          # 看 1 幀未來
-                        temporal_decay_tau=1.5   
+                        t=t, L=5, fuse_alpha=0.5
                     )
     
                     # -------- Step 3: to_out 投影（與你原本一致） --------
