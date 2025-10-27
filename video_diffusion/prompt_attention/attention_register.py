@@ -636,7 +636,13 @@ def register_attention_control(model, controller, text_cond, clip_length, height
                     # -------- Step 4: 攤回 (B*F, N, C) 並 return --------
                     hidden_states_ff = rearrange(hidden_states_ff, "b (f d) c -> (b f) d c", f=clip_length)
                     return hidden_states_ff
-
+                
+                # === 新增：當 [h,w] 不在 flatten_res 時的保底傳回 ===
+                # 直接沿用前面 full-frame/sliced attention 的輸出做線性投影並回傳
+                hidden_states = self.to_out[0](hidden_states)
+                hidden_states = self.to_out[1](hidden_states)
+                hidden_states = rearrange(hidden_states, "b (f d) c -> (b f) d c", f=clip_length)
+                return hidden_states
             else:
             ### original flow attention    
                 print(f"--- [h,w] : {[h,w]}, {kwargs['flatten_res']}")
