@@ -1,16 +1,11 @@
+# video_diffusion/prompt_attention/flow_traj_attn.py
 # -*- coding: utf-8 -*-
 import math
 import torch
 from einops import rearrange
 
-
-# ---------------------------------------------
-# Helpers
-# ---------------------------------------------
 def reshape_heads_to_batch_dim3(x, heads):
-    """
-    x: [(B*F), N, 1 or L, D] -> [(B*F), H, N, 1 or L, d_h]
-    """
+    # x: [(B*F), N, 1 or L, D] -> [(B*F), H, N, 1 or L, d_h]
     Bf, N, L, D = x.shape
     assert D % heads == 0, f"D={D} must be divisible by heads={heads}"
     d_h = D // heads
@@ -18,20 +13,10 @@ def reshape_heads_to_batch_dim3(x, heads):
     x = x.permute(0, 3, 1, 2, 4).contiguous()
     return x
 
-
 def take_block(mask, s, e):
     return mask[..., s:e]
 
-
 def normalize_traj_and_mask(traj, mask, F_clip, N):
-    """
-    將輸入的 traj / mask 正規化到：
-      traj: [F, N, L, 3]  (t,x,y)
-      mask: [F, N, L]     (bool/int)
-    支援下列形狀的自動轉換：
-      - traj: [F,N,L,3] 或 [N,F,L,3] 或 [(F*N),L,3]
-      - mask: [F,N,L]   或 [N,F,L]   或 [(F*N),L]
-    """
     # traj -> [F, N, L, 3]
     if traj.dim() == 4:
         if traj.shape[0] == F_clip and traj.shape[1] == N:
@@ -67,10 +52,7 @@ def normalize_traj_and_mask(traj, mask, F_clip, N):
     return traj, mask
 
 
-# ---------------------------------------------
-# Main: Flow + Same-Semantics Full-History Attention (No Top-K)
-# ---------------------------------------------
-@torch.no_grad()  # 你如果要訓練，請移除此 decorator
+@torch.no_grad()  # 要訓練的話拿掉這個 decorator
 def flow_semantic_traj_attention(
     query_old, key_old, value_old,
     encoder_hidden_states, group_norm,
@@ -80,10 +62,15 @@ def flow_semantic_traj_attention(
     controller, sem_chunk=128,    # chunk for memory
     use_sem_aug=True,
     flow_only=False,
-    old_qk=1
+    old_qk=1,
+    # ===== 新增（雙通道/雙向）=====
+    bidir: bool = False,
+    bidir_alpha: float = 0.5,
+    bidir_L: int = None,  # 目前保留接口，這版不裁窗，最小改動
 ):
     """
     每個 query 既看：自己過去的軌跡（self-traj），也看同幀同語意像素及其各自的過去軌跡（same-class past-traj）。
+    若 bidir=True，再做一次時間反轉的因果 pass，最後做 convex fuse: (1-α)·fwd + α·bwd。
     """
     device = encoder_hidden_states.device
     base_dtype = key_old.dtype
@@ -109,7 +96,8 @@ def flow_semantic_traj_attention(
     if group_norm is not None:
         encoder_hidden_states = group_norm(encoder_hidden_states.transpose(1, 2)).transpose(1, 2)
 
-    # ---- 軌跡與 mask（均為 [F,N,L,*]）----
+    # ---- 正規化：得到 [F,N,L,*] ----
+    traj, mask = normalize_traj_and_mask(traj, mask, F_clip, N)  # [F,N,L,3], [F,N,L]
     t_inds = traj[..., 0].long()  # [F,N,L]
     x_inds = traj[..., 1].long()
     y_inds = traj[..., 2].long()
@@ -124,93 +112,96 @@ def flow_semantic_traj_attention(
     x_inds = torch.where(traj_mask, x_inds, torch.zeros_like(x_inds))
     y_inds = torch.where(traj_mask, y_inds, torch.zeros_like(y_inds))
 
-    # flat 位置 id：同幀語義去重用
-    flat_traj = (t_inds * N + (x_inds * W + y_inds)).unsqueeze(0).expand(Bsmall, F_clip, N, -1)  # [B,F,N,L]
+    # flatten index：同幀語義去重用
+    flat_traj = (t_inds * N + (x_inds * W + y_inds))  # [F,N,L]
 
     # Q
     query_tempo = query.unsqueeze(-2)  # [(B*F), N, 1, D]
     q_h = reshape_heads_to_batch_dim3(query_tempo, heads=heads).to(acc_dtype)
 
     # 沿軌跡 gather K/V
-    key_tempo   = _key[:, t_inds, x_inds, y_inds]    # [B, F, N, L, D]
-    value_tempo = _value[:, t_inds, x_inds, y_inds]  # [B, F, N, L, D]
+    with torch.autocast(device_type=str(device).split(':')[0], enabled=False):
+        key_tempo   = _key[:, t_inds, x_inds, y_inds]    # [B, F, N, L, D]
+        value_tempo = _value[:, t_inds, x_inds, y_inds]  # [B, F, N, L, D]
     key_tempo   = rearrange(key_tempo,   'b f n l d -> (b f) n l d')
     value_tempo = rearrange(value_tempo, 'b f n l d -> (b f) n l d')
-    kt_h = reshape_heads_to_batch_dim3(key_tempo, heads=heads).to(acc_dtype)  # [(B*F), H, N, L, d_h]
-    vt_h = reshape_heads_to_batch_dim3(value_tempo, heads=heads).to(acc_dtype) # [(B*F), H, N, L, d_h]
+    kt_h = reshape_heads_to_batch_dim3(key_tempo,   heads=heads).to(acc_dtype)  # [(B*F),H,N,L,d_h]
+    vt_h = reshape_heads_to_batch_dim3(value_tempo, heads=heads).to(acc_dtype)  # [(B*F),H,N,L,d_h]
 
-    # mask 只作用在 self-traj 部分
-    keep_mask = mask.to(torch.bool) & traj_mask
-    keep_mask_b = keep_mask.unsqueeze(0).expand(Bsmall, F_clip, N, keep_mask.size(-1))  # [B,F,N,L]
-    mask_traj_bf = rearrange(keep_mask_b, 'b f n l -> (b f) n l')                       # [(B*F),N,L]
-    attn_mask = mask_traj_bf[:, None].repeat(1, heads, 1, 1).unsqueeze(-2)              # [(B*F),H,N,1,L] (bool)
+    # sreg: 支援 [B,F,N,N] 或 [Bhz,FN,FN]
+    if use_sem_aug and controller.sreg_maps[h * w] is not None:
+        sreg_any = controller.sreg_maps[h * w]
+        if sreg_any.dim() == 4 and sreg_any.size(1) == F_clip and sreg_any.size(2) == N and sreg_any.size(3) == N:
+            if sreg_any.size(0) == 1 and Bsmall > 1:
+                sreg_pf = sreg_any.expand(Bsmall, F_clip, N, N).contiguous()
+            else:
+                sreg_pf = sreg_any
+            sreg_pf = (sreg_pf > 0)
+            sreg_full = None
+        else:
+            # 舊格式 [Bhz, FN, FN]
+            sreg_full = sreg_any
+            if sreg_full.size(0) == 1:
+                sreg_full = sreg_full.expand(Bsmall, FN, FN)
+            elif sreg_full.size(0) != Bsmall:
+                raise RuntimeError(f"Unsupported sreg batch {sreg_full.size(0)} vs B={Bsmall}")
+            sreg_pf = None
+    else:
+        sreg_pf = None
+        sreg_full = None
 
-    # 流式 softmax 容器
-    scale = torch.tensor(1.0 / math.sqrt(q_h.size(-1)), dtype=acc_dtype, device=device)
-    out_all = torch.empty((Bsmall * F_clip, heads, N, q_h.size(-1)),
-                          device=device, dtype=base_dtype)
+    # ---- Streaming Softmax 容器（前向）----
+    d_h = q_h.size(-1)
+    scale = torch.tensor(1.0 / math.sqrt(d_h), dtype=acc_dtype, device=device)
+    out_all = torch.empty((Bsmall * F_clip, heads, N, d_h), device=device, dtype=base_dtype)
 
-    # sreg（full or per-frame）
-    sreg_full = None
-    if use_sem_aug and getattr(controller, "sreg_maps", None) is not None and controller.sreg_maps.get(h * w, None) is not None:
-        sreg_full = controller.sreg_maps[h * w]  # [B or 1, FN, FN]
-        assert sreg_full.dim() == 3 and sreg_full.size(1) == FN and sreg_full.size(2) == FN, \
-            f"sreg shape mismatch: got {tuple(sreg_full.shape)}, expect (*,{FN},{FN})"
-        if sreg_full.size(0) == 1:
-            sreg_full = sreg_full.expand(Bsmall, FN, FN)
-        elif sreg_full.size(0) != Bsmall:
-            raise RuntimeError(f"Unexpected sreg batch dim: {sreg_full.size(0)} vs B={Bsmall}")
-
+    keep_mask = (mask.to(torch.bool) & traj_mask)  # [F,N,L]
     # 逐幀
     for fcur in range(F_clip):
-        bf_idx = (torch.arange(Bsmall, device=device) * F_clip + fcur)  # [B]
-        q_h_f  = q_h[bf_idx]               # [B,H,N,1,d_h]
-        kt_h_f = kt_h[bf_idx]              # [B,H,N,L,d_h]
-        vt_h_f = vt_h[bf_idx]              # [B,H,N,L,d_h]
+        bf_idx = (torch.arange(Bsmall, device=device) * F_clip + fcur)   # [B]
+        q_h_f  = q_h[bf_idx]    # [B,H,N,1,d_h]
+        kt_f   = kt_h[bf_idx]   # [B,H,N,L,d_h]
+        vt_f   = vt_h[bf_idx]   # [B,H,N,L,d_h]
 
-        # (1) self-traj
-        logits_traj = torch.matmul(q_h_f * scale, kt_h_f.transpose(-2, -1))  # [B,H,N,1,L]
-        local_neg_inf = torch.finfo(acc_dtype).min
-        bias_traj_f = torch.zeros_like(logits_traj, dtype=acc_dtype, device=device)
-        bias_traj_f = torch.where(
-            rearrange(attn_mask[bf_idx], 'b h n one l -> b h n one l'),
-            bias_traj_f,
-            torch.full_like(bias_traj_f, local_neg_inf)
-        )
-        logits_traj = logits_traj + bias_traj_f
-        m  = torch.max(logits_traj, dim=-1, keepdim=False).values    # [B,H,N,1]
-        exp_logits = torch.exp(logits_traj - m.unsqueeze(-1))        # [B,H,N,1,L]
-        Z   = exp_logits.sum(dim=-1)                                 # [B,H,N,1]
-        Out = torch.matmul(exp_logits, vt_h_f)                       # [B,H,N,1,d_h]
+        # (1) Self-traj
+        logits_traj = torch.matmul(q_h_f * scale, kt_f.transpose(-2, -1))  # [B,H,N,1,L]
+        keep_mask_b = keep_mask[fcur].unsqueeze(0).expand(Bsmall, N, keep_mask.size(-1))  # [B,N,L]
+        attn_mask = keep_mask_b[:, None, :, None, :]  # [B,1,N,1,L]
+        neg_val = torch.finfo(logits_traj.dtype).min
+        logits_traj = logits_traj.masked_fill(~attn_mask, neg_val)
 
-        # (2) 同幀同語意 + 其過去軌跡
-        if sreg_full is not None:
-            q_flat = fcur * N + torch.arange(N, device=device)       # [N]
-            sreg_rows = torch.take_along_dim(
-                sreg_full, q_flat.view(1, -1, 1).expand(Bsmall, N, FN), dim=1
-            )                                                        # [B, N, FN]
-            sreg_rows_frame = sreg_rows[:, :, fcur * N:(fcur + 1) * N]   # [B, N, N]
-            same_sem_mask = (sreg_rows_frame > 0)                        # [B, N, N]
+        m  = torch.max(logits_traj, dim=-1, keepdim=True).values  # [B,H,N,1,1]
+        exp_logits = torch.exp(logits_traj - m)                   # [B,H,N,1,L]
+        Z   = exp_logits.sum(dim=-1, keepdim=True)                # [B,H,N,1,1]
+        Out = torch.matmul(exp_logits, vt_f)                      # [B,H,N,1,d_h]
 
-            # 去掉「自身軌跡在當幀的位置」以避免重複
-            traj_cols_this = (flat_traj[:, fcur] % N)  # [B, N, L]
-            B_, N_, L_ = traj_cols_this.shape
-            idx_b = torch.arange(B_, device=device)[:, None, None].expand(B_, N_, L_)
-            idx_n = torch.arange(N_, device=device)[None, :, None].expand(B_, N_, L_)
-            same_sem_mask[idx_b, idx_n, traj_cols_this] = False
+        # (2) 同幀同語意 + 過去軌跡
+        if sreg_pf is not None or sreg_full is not None:
+            if sreg_pf is not None:
+                same_sem_mask = sreg_pf[:, fcur]  # [B,N,N]
+            else:
+                # 從 full 版擷取當幀 N×N 區塊
+                r = slice(fcur * N, (fcur + 1) * N)
+                same_sem_mask = (sreg_full[:, r, r] > 0)  # [B,N,N]
 
-            C = sem_chunk if sem_chunk > 0 else N
-            for s in range(0, N, C):
-                e = min(s + C, N)
+            traj_cols_this = (flat_traj[fcur] % N)  # [N,L]
+            M = torch.zeros((Bsmall, N, N), dtype=torch.bool, device=device)
+            idx_scatter = traj_cols_this.unsqueeze(0).expand(Bsmall, -1, -1)  # [B,N,L]
+            M.scatter_(dim=2, index=idx_scatter, src=torch.ones_like(idx_scatter, dtype=torch.bool, device=device))
+            same_sem_mask = same_sem_mask & (~M)  # [B,N,N]
+
+            Cc = sem_chunk if sem_chunk > 0 else N
+            for s in range(0, N, Cc):
+                e = min(s + Cc, N)
                 mask_chunk = take_block(same_sem_mask, s, e)            # [B,N,C]
                 mask_chunk = mask_chunk[:, None, :, None, :].expand(-1, heads, -1, 1, -1)  # [B,H,N,1,C]
 
-                Kc = kt_h_f[:, :, s:e, :, :]   # [B,H,C,L,d_h]
-                Vc = vt_h_f[:, :, s:e, :, :]   # [B,H,C,L,d_h]
-                Bc, Hh, Cc, Ll, Dh = Kc.shape
-                CL = Cc * Ll
-                Kc_flat = Kc.reshape(Bc, Hh, CL, Dh).unsqueeze(2)  # [B,H,1,CL,d_h]
-                Vc_flat = Vc.reshape(Bc, Hh, CL, Dh).unsqueeze(2)  # [B,H,1,CL,d_h]
+                Kc = kt_f[:, :, s:e, :, :]   # [B,H,C,L,d_h]
+                Vc = vt_f[:, :, s:e, :, :]   # [B,H,C,L,d_h]
+                Bc, Hh, Cnum, Ll, Dh = Kc.shape
+                CL = Cnum * Ll
+                Kc_flat = Kc.reshape(Bc, Hh, CL, Dh).unsqueeze(2)  # [B,H,1,CL,d]
+                Vc_flat = Vc.reshape(Bc, Hh, CL, Dh).unsqueeze(2)  # [B,H,1,CL,d]
 
                 logits_c = torch.matmul(q_h_f * scale, Kc_flat.transpose(-2, -1))  # [B,H,N,1,CL]
                 mask_chunk_CL = mask_chunk.repeat_interleave(Ll, dim=-1)           # [B,H,N,1,CL]
@@ -218,179 +209,77 @@ def flow_semantic_traj_attention(
                 logits_c = torch.where(mask_chunk_CL, logits_c, torch.full_like(logits_c, neg_inf))
 
                 m_c = torch.max(logits_c, dim=-1, keepdim=True).values     # [B,H,N,1,1]
-                m_new = torch.maximum(m, m_c.squeeze(-1))                  # [B,H,N,1]
-                alpha = torch.exp(m - m_new)                               # [B,H,N,1]
-
-                Z = Z * alpha + torch.sum(torch.exp(logits_c - m_new.unsqueeze(-1)), dim=-1)  # [B,H,N,1]
-                Out = Out * alpha.unsqueeze(-1) + (torch.exp(logits_c - m_new.unsqueeze(-1)) @ Vc_flat)  # [B,H,N,1,d_h]
+                m_new = torch.maximum(m, m_c)                               # [B,H,N,1,1]
+                alpha = torch.exp(m - m_new)                                # [B,H,N,1,1]
+                Z  = Z  * alpha + torch.sum(torch.exp(logits_c - m_new), dim=-1, keepdim=True)   # [B,H,N,1,1]
+                Out = Out * alpha + (torch.exp(logits_c - m_new) @ Vc_flat)                       # [B,H,N,1,d]
                 m = m_new
 
-        out_f = (Out / Z.unsqueeze(-1)).squeeze(-2)  # [B,H,N,d_h]
+        out_f = (Out / (Z + 1e-12)).squeeze(-2)   # [B,H,N,d_h]
         out_all[bf_idx] = out_f.to(base_dtype)
 
-    hidden_states = rearrange(out_all, '(b f) h (H W) d -> b (f H W) (h d)', b=Bsmall, f=F_clip, H=H, W=W)
-    return hidden_states
+    # 回到 [(B*F), (H*W), (H*d_h)] layout
+    hidden_states_fwd = rearrange(out_all, '(b f) h (H W) d -> b (f H W) (h d)', b=Bsmall, f=F_clip, H=H, W=W)
 
+    # =====================（可選）雙向 pass =====================
+    if not bidir:
+        return hidden_states_fwd
 
-# ---------------------------------------------
-# sreg 相關輔助（full -> per-frame、子序列裁切）
-# ---------------------------------------------
-def _sreg_full_to_per_frame(sreg_full, F_clip, N, B, device):
-    """
-    sreg_full: [Bhz, FN, FN] (可能是 1、B 或 B*頭數)
-    回傳 per-frame: [B, F, N, N] 只保留每幀的 N×N 對角塊
-    """
-    assert sreg_full.dim() == 3 and sreg_full.size(1) == F_clip * N and sreg_full.size(2) == F_clip * N
-    Bhz, FN1, FN2 = sreg_full.shape
-    assert FN1 == FN2 == F_clip * N
+    # 1) 反轉時間軸的 _key/_value
+    _key_rev   = _key[:, torch.arange(F_clip-1, -1, -1, device=device), ...]
+    _value_rev = _value[:, torch.arange(F_clip-1, -1, -1, device=device), ...]
+    # 2) 反轉時間座標：t' = F-1 - t
+    traj_rev = traj.clone()
+    traj_rev[..., 0] = (F_clip - 1) - traj_rev[..., 0]
+    mask_rev = mask  # mask 本身不需要數值變更（但對應的 gather 會跟著 t' 走）
 
-    if Bhz == 1:
-        sreg_b = sreg_full.expand(B, FN1, FN2)
-    elif Bhz == B:
-        sreg_b = sreg_full
+    # 3) 若 sreg 是 full 版，做 FN 對應的雙側置換；per-frame 版則只需倒序 frame 索引
+    if sreg_full is not None:
+        # 建立 frame 反轉的 token 置換表
+        perm_frames = []
+        for f in range(F_clip-1, -1, -1):
+            r = torch.arange(f*N, (f+1)*N, device=device)
+            perm_frames.append(r)
+        perm = torch.cat(perm_frames, dim=0)  # [FN]
+        sreg_full_rev = sreg_full[:, perm][:, :, perm]  # [B, FN, FN]
+        sreg_pf_rev = None
+    elif sreg_pf is not None:
+        sreg_pf_rev = sreg_pf[:, torch.arange(F_clip-1, -1, -1, device=device)]
+        sreg_full_rev = None
     else:
-        assert Bhz % B == 0, f"Cannot map sreg batch {Bhz} to B={B}."
-        Hstar = Bhz // B
-        sreg_b = sreg_full.view(B, Hstar, FN1, FN2).amax(dim=1)
+        sreg_pf_rev = None
+        sreg_full_rev = None
 
-    sreg_b = (sreg_b > 0)
+    # 暫時換掉 controller 的 sreg_maps
+    sreg_backup = controller.sreg_maps.get(h*w, None) if hasattr(controller, "sreg_maps") else None
+    if hasattr(controller, "sreg_maps"):
+        if sreg_full_rev is not None:
+            controller.sreg_maps[h*w] = sreg_full_rev
+        elif sreg_pf_rev is not None:
+            controller.sreg_maps[h*w] = sreg_pf_rev
 
-    out = torch.empty((B, F_clip, N, N), dtype=torch.bool, device=device)
-    for f in range(F_clip):
-        r = slice(f * N, (f + 1) * N)
-        out[:, f] = sreg_b[:, r, r]
-    return out
-
-
-def _slice_sreg_per_frame(controller, hw, F_total, N, B, device, t0, t1):
-    """
-    從 controller.sreg_maps[hw] 取出 [B, F_total, N, N] 的 per-frame，再裁成子序列 [B, L_eff, N, N]
-    - 支援來源是 [B or 1, F, N, N] 或 [B or 1, FN, FN]
-    """
-    if getattr(controller, "sreg_maps", None) is None:
-        return None
-    sreg_any = controller.sreg_maps.get(hw, None)
-    if sreg_any is None:
-        return None
-
-    if sreg_any.dim() == 4 and sreg_any.size(1) == F_total and sreg_any.size(2) == N and sreg_any.size(3) == N:
-        if sreg_any.size(0) == 1 and B > 1:
-            sreg_pf = sreg_any.expand(B, F_total, N, N).contiguous()
-        elif sreg_any.size(0) in (1, B):
-            sreg_pf = sreg_any
-        else:
-            raise RuntimeError(f"sreg batch dim mismatch: {sreg_any.size(0)} vs B={B}")
-        sreg_pf = (sreg_pf > 0)
-    elif sreg_any.dim() == 3 and sreg_any.size(1) == F_total * N and sreg_any.size(2) == F_total * N:
-        sreg_pf = _sreg_full_to_per_frame(sreg_any.to(device), F_total, N, B, device)  # [B,F,N,N]
-    else:
-        raise RuntimeError(f"Unsupported sreg shape {tuple(sreg_any.shape)} for F={F_total}, N={N}")
-
-    return sreg_pf[:, t0:t1]  # [B, L_eff, N, N]
-
-
-# ---------------------------------------------
-# Bi-dir window wrapper（嚴格只看當前與過去）
-# ---------------------------------------------
-@torch.no_grad()  # 要訓練就移除此 decorator
-def flow_traj_attn_bidir_window(
-    query_old, key_old, value_old,
-    encoder_hidden_states, group_norm,
-    traj, mask,
-    _key, _value,           # [B, F, H, W, D]
-    h, w, clip_length, heads,
-    controller, sem_chunk=128, use_sem_aug=True,
-    flow_only=False, old_qk=1,
-    # 視窗設定
-    t=0, L=5, fuse_alpha=0.5,
-):
-    """
-    在子序列 [t0..t]（長度 L_eff）內做「前向 causal」與「反向 causal」，融合後只取當前幀 t 的輸出。
-    - 不看 t+1 之後。
-    - 回傳: [B, N, D]
-    """
-    device = encoder_hidden_states.device
-    BxF, _, D = encoder_hidden_states.shape
-    H, W = h, w
-    N = H * W
-    B = BxF // clip_length
-    assert B * clip_length == BxF
-
-    # ---- 子序列範圍 ----
-    t0 = max(0, t - (L - 1))
-    t1 = t + 1
-    L_eff = t1 - t0
-
-    # ---- 正規化 → 取子序列 → 讓 t 指標變成子序列相對時間 ----
-    traj_full, mask_full = normalize_traj_and_mask(traj, mask, F_clip=clip_length, N=N)  # [F,N,Ltraj,*], [F,N,Ltraj]
-    traj_sub = traj_full[t0:t1].clone()
-    mask_sub = mask_full[t0:t1].clone()
-
-    # 把 (絕對 t) 轉成子序列相對 t： t' = t - t0
-    t_inds = traj_sub[..., 0]
-    t_inds = (t_inds - t0).clamp_(min=0, max=L_eff - 1)
-    traj_sub[..., 0] = t_inds
-
-    # ---- K/V 子序列 ----
-    _key_sub   = _key[:, t0:t1]     # [B, L_eff, H, W, D]
-    _value_sub = _value[:, t0:t1]   # [B, L_eff, H, W, D]
-
-    # ---- sreg 子序列 (per-frame) ----
-    sreg_pf_sub = _slice_sreg_per_frame(controller, h * w, F_total=clip_length, N=N, B=B,
-                                        device=device, t0=t0, t1=t1)  # [B,L_eff,N,N] or None
-    # 暫存→覆寫 controller.sreg_maps[hw] 成子序列 per-frame，方便 core 直接吃
-    orig_sreg = controller.sreg_maps.get(h * w, None) if getattr(controller, "sreg_maps", None) is not None else None
-    if getattr(controller, "sreg_maps", None) is not None and sreg_pf_sub is not None:
-        controller.sreg_maps[h * w] = sreg_pf_sub  # core 會吃到 per-frame 版本
-
-    # ---- 前向（子序列內）----
-    out_fwd = flow_semantic_traj_attention(
-        query_old=query_old, key_old=key_old, value_old=value_old,
-        encoder_hidden_states=encoder_hidden_states, group_norm=group_norm,
-        traj=traj_sub, mask=mask_sub, time_causal=True,
-        _key=_key_sub, _value=_value_sub,
-        h=h, w=w, clip_length=L_eff, heads=heads,
-        controller=controller, sem_chunk=sem_chunk,
-        use_sem_aug=use_sem_aug, flow_only=flow_only, old_qk=old_qk
-    )  # [B, (L_eff*N), D]
-    out_fwd = rearrange(out_fwd, 'b (f n) d -> b f n d', f=L_eff, n=N)  # [B, L_eff, N, D]
-
-    # ---- 反向（子序列內翻轉 + 相對 t 反轉）----
-    traj_rev = traj_sub.flip(0).clone()  # 先沿 F 維翻轉
-    t_inds_rev = traj_rev[..., 0]
-    t_inds_rev = (L_eff - 1) - t_inds_rev
-    t_inds_rev.clamp_(min=0, max=L_eff - 1)
-    traj_rev[..., 0] = t_inds_rev
-
-    mask_rev = mask_sub.flip(0).contiguous()
-    _key_rev   = _key_sub.flip(1).contiguous()
-    _value_rev = _value_sub.flip(1).contiguous()
-    sreg_rev = sreg_pf_sub.flip(1).contiguous() if sreg_pf_sub is not None else None
-    if getattr(controller, "sreg_maps", None) is not None and sreg_rev is not None:
-        controller.sreg_maps[h * w] = sreg_rev  # 覆寫成反向子序列的 per-frame
-
-    out_bwd_rev = flow_semantic_traj_attention(
-        query_old=query_old, key_old=key_old, value_old=value_old,
-        encoder_hidden_states=encoder_hidden_states, group_norm=group_norm,
-        traj=traj_rev, mask=mask_rev, time_causal=True,
-        _key=_key_rev, _value=_value_rev,
-        h=h, w=w, clip_length=L_eff, heads=heads,
-        controller=controller, sem_chunk=sem_chunk,
-        use_sem_aug=use_sem_aug, flow_only=flow_only, old_qk=old_qk
+    # 4) 重新跑一次相同邏輯（反向因果）：時間仍是 past-causal，只是資料已反轉
+    # --- 下面直接「遞迴」呼叫本函式，但關掉 bidir 以避免再反向一次 ---
+    hidden_states_bwd_rev = flow_semantic_traj_attention(
+        query_old, key_old, value_old,
+        encoder_hidden_states, group_norm,
+        traj_rev, mask_rev, time_causal,
+        _key_rev, _value_rev,
+        h, w, clip_length, heads,
+        controller, sem_chunk,
+        use_sem_aug, flow_only, old_qk,
+        bidir=False,  # 關掉遞迴雙向
     )
-    out_bwd_rev = rearrange(out_bwd_rev, 'b (f n) d -> b f n d', f=L_eff, n=N)  # 反向的輸出
-    out_bwd = out_bwd_rev.flip(1).contiguous()  # 翻回正時間：[B, L_eff, N, D]
-
-    # ---- 融合 & 只取當前幀 (子序列最後一幀) ----
-    alpha = float(fuse_alpha)
-    out_fused = alpha * out_fwd + (1.0 - alpha) * out_bwd  # [B,L_eff,N,D]
-    out_t = out_fused[:, -1]  # [B, N, D] 對應原序列的幀 t
 
     # 還原 controller 的 sreg
-    if getattr(controller, "sreg_maps", None) is not None:
-        if orig_sreg is None:
-            controller.sreg_maps.pop(h * w, None)
-        else:
-            controller.sreg_maps[h * w] = orig_sreg
+    if hasattr(controller, "sreg_maps"):
+        controller.sreg_maps[h*w] = sreg_backup
 
-    return out_t
+    # 5) 把 bwd 結果在 frame 維度反轉回原順序
+    hb = rearrange(hidden_states_bwd_rev, 'b (f n) c -> b f n c', f=F_clip, n=N)
+    hb = hb[:, torch.arange(F_clip-1, -1, -1, device=device)]
+    hidden_states_bwd = rearrange(hb, 'b f n c -> b (f n) c')
+
+    # 6) convex fuse
+    out = (1.0 - bidir_alpha) * hidden_states_fwd + bidir_alpha * hidden_states_bwd
+    return out
