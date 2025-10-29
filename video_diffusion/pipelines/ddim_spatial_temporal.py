@@ -6,9 +6,13 @@ import torch
 import numpy as np
 from einops import rearrange
 from tqdm import tqdm
-
+import os, time
+import cv2
+from PIL import Image
 from diffusers.utils import deprecate, logging
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
+import imageio.v2 as imageio  # 需有 ffmpeg，環境通常已內建；沒有就 pip install imageio-ffmpeg
+
 
 
 from .stable_diffusion import SpatioTemporalStableDiffusionPipeline
@@ -35,6 +39,8 @@ from diffusers.schedulers import (
 )
 import os
 import nltk
+
+
 nltk.download('punkt')
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -483,6 +489,24 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
                                                         attention_type = "FullyFrameAttention"
         #print("attention_type:",attention_type)
         return attention_type
+    
+    # ==== [REPLACE FROM HERE] ===============================================
+    def _excel_letters(self, n: int) -> str:
+        """0 -> 'a', 1 -> 'b', ... 25 -> 'z', 26 -> 'aa', ... (lowercase)."""
+        s = []
+        n += 1
+        while n:
+            n, r = divmod(n - 1, 26)
+            s.append(chr(ord('a') + r))
+        return ''.join(reversed(s))
+    
+    def _gen_identity_names(self, seg_cls: int):
+        base = ["S", "B", "BG"]  # fixed first three
+        if seg_cls <= len(base):
+            return base[:seg_cls]
+        # add a, b, c, ... after BG (can go beyond 'z' -> 'aa', 'ab', ...)
+        extras = [self._excel_letters(i) for i in range(seg_cls - len(base))]
+        return base + extras
 
     def _prepare_attention_layout(self,bsz,height,width,layouts,prompts,clip_length,attention_type,device):
         ## current layouts  f s c h w
@@ -490,6 +514,7 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
 
         #print("prompt:",prompts)
         # sp_sz =self.unet.sample_size
+        print("============ prepare attention layout ===============")
         sp_sz = height*width
         frames, seg_cls, c, h ,w = layouts.shape
         text_input = self.tokenizer(prompts, padding="max_length", return_length=True, return_overflowing_tokens=False, 
@@ -514,12 +539,20 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         sreg_maps = {}
         reg_sizes = {}
         reg_sizes_c = {}
-
+        
+        # === 🔵 新增：分 class 的 sreg 與尺寸比例 ===
+        sreg_maps_class = {}   # key: Q (=h*w) ; val: [bsz, 1, Q, Q, C]  (C = seg_cls or seg_cls+1 with BG)
+        reg_sizes_class = {}   # key: Q ; val: [bsz, 1, 1, 1, C]
+ 
+                
         device = layouts.device
 
         frame_index_pre = torch.arange(frames)+(-1)
         frame_index_pre = frame_index_pre.clip(0, frames-1)
+        
 
+        id_masks_by_res = {}           
+            
         for r in range(4):
             layouts_s_frames = []
             if attention_type == "SparseCausalAttention":
@@ -527,11 +560,48 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
 
             h = int(height/np.power(2,r))
             w= int(width/np.power(2,r))
+            Q = h*w
+
             #layouts torch.Size([70, 2, 1, 64, 64])
             # layouts_interpolate = F.interpolate(layouts.squeeze(2), (res, res), mode='nearest').unsqueeze(2)    
-            layouts_interpolate = F.interpolate(layouts.squeeze(2), (h, w), mode='nearest').unsqueeze(2)  
-            layouts_interpolate = layouts_interpolate.view(frames,seg_cls,1,-1)   ## frames,seg_cls,1,res^2
+            layouts_interpolate_flat = F.interpolate(layouts.squeeze(2), (h, w), mode='nearest').unsqueeze(2)  
+            layouts_interpolate = layouts_interpolate_flat.view(frames,seg_cls,1,-1)   ## frames,seg_cls,1,res^2
+            # layouts_interp_hw = layouts_interpolate_flat
 
+
+            # >>> [ADDED]：在「這個解析度」下，建立每幀、每身份的二值 mask
+            #  取得 class channel 的 one-hot（因為你的 layouts 看起來已經是 0/1 mask，直接 >0 就好）
+            #  shape: [F, S, H*W]
+            class_mask_flat = (layouts_interpolate.squeeze(2) > 0).to(torch.float32)        # >>> [ADDED]
+            # 展回 [F, S, H, W]
+            class_mask_hw = class_mask_flat.view(frames, seg_cls, h, w)                     # >>> [ADDED]
+    
+             # ---- NEW: generate identity names by channel index order
+            id_names = self._gen_identity_names(seg_cls)  # e.g., ['S','B','BG','a','b',...]
+            id_dict = {}
+        
+            # Fill per-identity masks: each entry -> list of [H,W] per frame (no extra math)
+            # If seg_cls < len(id_names) (shouldn't happen), missing ones default to zeros.
+            for cidx, name in enumerate(id_names):
+                if cidx < seg_cls:
+                    stack = class_mask_hw[:, cidx]  # [F, h, w]
+                else:
+                    stack = torch.zeros((frames, h, w), device=class_mask_hw.device)
+                id_dict[name] = [stack[t].contiguous() for t in range(frames)]
+        
+            # Store by resolution key Q
+            id_masks_by_res[Q] = id_dict
+            print("[DBG] id_masks_by_res keys:", list(id_masks_by_res.keys()))
+            for k, v in id_masks_by_res.items():
+                print(f"  {k}: type={type(v)}")
+                if isinstance(v, dict):
+                    print("    subkeys:", list(v.keys()))
+                    for subk, subv in v.items():
+                        if isinstance(subv, torch.Tensor):
+                            print(f"      {subk}: shape={tuple(subv.shape)} dtype={subv.dtype}")
+                        else:
+                            print(f"      {subk}: type={type(subv)}")
+        
             ### implementation of sparse casual attn and fully frame attn
             for i in range(frames):
                 #layouts_f = layouts[i]
@@ -563,19 +633,7 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
                 sreg_maps[h*w] = layouts_s_sparse_attn
                 reg_sizes[h*w] = 1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(clip_length, 2))
                 reg_sizes_c[h*w]  = 1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(clip_length, 2))
-            #### code for check error#####
-            # num_nonzero = torch.count_nonzero(layouts_s_frames)
-            # print("num_nonzero",num_nonzero)
-            # print("layouts_s_frames",layouts_s_frames.shape)
-            # print("layouts_s_frames",layouts_s_frames)
-            # print("reg_size final shape:", (1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(res, 2))).shape)
-            # print("reg_size", (1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(res, 2))))
-            #### code for check error#####
 
-
-            #print("layouts_s",layouts_s.shape)
-
-            #print("layouts_s.view(layouts_s.size(0),-1,1)",*layouts_s.view(layouts_s.size(0),-1,1).shape)
 
             if attention_type == "FullyFrameAttention":
                 layouts_s= rearrange(layouts_interpolate,"f s c res -> s c (f res)")
@@ -589,15 +647,7 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
                     sreg_maps[h*w] = layouts_s
                     reg_sizes[h*w] = 1-1.*layouts_s.sum(-1, keepdim=True)/((h*clip_length)*(w*clip_length))
                     reg_sizes_c[h*w]  =  1-1.*layouts_s_frames.sum(-1, keepdim=True)/(h*w)
-                #print("layouts_s",layouts_s.shape)
-                # if res == 64:
-                #     reg_sizes[np.power(res, 2)] = None
-                # else:
-                #     reg_sizes[np.power(res, 2)] = 1-1.*layouts_s.sum(-1, keepdim=True)/(np.power(res*clip_length, 2))
-                # #sreg_maps[np.power(res, 2)] = layouts_s_frames
-                # sreg_maps[np.power(res, 2)] = layouts_s
-                # reg_sizes_c[np.power(res, 2)]  =  1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(res, 2))
-            
+                #print("layouts_s",layouts_s.shape)    
             
         ###########################
         ###### prep for creg ######
@@ -636,17 +686,18 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         ###########################
         text_cond = torch.cat([uncond_embeddings, cond_embeddings[:1].repeat(bsz,1,1)])
 
-        return text_cond, sreg_maps, creg_maps, reg_sizes, reg_sizes_c
+        return text_cond, sreg_maps, creg_maps, reg_sizes, reg_sizes_c, sreg_maps_class, reg_sizes_class, id_masks_by_res
 
 
 
-    @torch.no_grad()
     def __call__(
         self,
         prompt: Union[str, List[str]],
         image: Union[torch.FloatTensor, PIL.Image.Image] = None,
         latent_mask: Union[torch.FloatTensor, PIL.Image.Image] = None,
         layouts: Union[torch.FloatTensor, PIL.Image.Image] = None,
+        latent_part_mask: Union[torch.FloatTensor, PIL.Image.Image] = None,
+        part_layouts: Union[torch.FloatTensor, PIL.Image.Image] = None,
         blending_percentage: float=0.25,
         modulated_percentage: float=0.3,
         height: Optional[int] = None,
@@ -674,7 +725,7 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         attn_inversion_dict: dict=None,
         **kwargs,
     ):
-        print("in pipeline call function.")
+        print("============= pipeline =================")
         # 0. Default height and width to unet
         t , c , height, width = image.shape
         prompt = OmegaConf.to_container(prompt, resolve=True)
@@ -693,35 +744,58 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         self.scheduler.set_timesteps(num_inference_steps, device=device)
-
+        
         if latents is None:
+            # cache_path = "./inversion_cache/inversion_latents.pt"
+            
+            # if os.path.exists(cache_path):
+            #     print(f"✅ Found cached inversion latents at {cache_path}")
+            #     data = torch.load(cache_path, map_location="cuda")   # 自動放回 GPU
+            #     latents = data["latents"]
+            #     attn_inversion_dict = data["attn_inversion_dict"]
+            # else:
+            #     os.makedirs(cache_path, exist_ok=True)
             latents, attn_inversion_dict = self.prepare_latents_ddim_inverted(
                 image, batch_size, source_prompt,
-                do_classifier_free_guidance, generator, 
+                do_classifier_free_guidance, generator,
                 control, controlnet_conditioning_scale, use_pnp, cluster_inversion_feature
             )
-            print("use inversion latents")
-
+                # print("use inversion latents")
+            
+                # torch.save({
+                #     "latents": latents.cpu(),
+                #     "attn_inversion_dict": attn_inversion_dict
+                # }, cache_path)
         ## prepare text embedding, self attention map, cross attention map
         _, _, _, downsample_height, downsample_width = latents.shape
-
         attention_type = self._get_attention_type()
-        text_cond, sreg_maps, creg_maps, reg_sizes,reg_sizes_c = self._prepare_attention_layout(batch_size,downsample_height,downsample_width,
-                                                                                                layouts,prompt,clip_length,attention_type,device)
-        
+
+        text_cond, sreg_maps, creg_maps, reg_sizes,reg_sizes_c,sreg_maps_class, reg_sizes_class, id_masks_by_res = self._prepare_attention_layout(batch_size,downsample_height,downsample_width,layouts, prompt,clip_length,attention_type,device)
+                                                                                                
+        # , sreg_maps_class, reg_sizes_class, id_masks_by_res
         time_steps = self.scheduler.timesteps
 
         #============do visualization for st-layout attn===============#
         self.store_controller = attention_util.AttentionStore()
+        print(f"====attn:{attention_type}")
         editor = ST_Layout_Attn_ControlEdit(text_cond=text_cond,sreg_maps=sreg_maps,creg_maps=creg_maps,reg_sizes=reg_sizes,reg_sizes_c=reg_sizes_c,
                                                 time_steps=time_steps,clip_length=clip_length,attention_type=attention_type,
                                                 additional_attention_store=self.store_controller,
                                                 save_self_attention = True,
                                                 disk_store = False,
                                                 video = image,
+                                                # id_maps = id_maps
+                                                # sreg_maps_class = sreg_maps_class,
+                                                # reg_sizes_class = reg_sizes_class,
+                                                id_masks_by_res = id_masks_by_res
                                                 )  
-        print("register_attention_control")
-        attention_util.register_attention_control(self, editor, text_cond, clip_length, downsample_height,downsample_width,ddim_inversion=False)
+        print("======register_attention_control=======")
+        if editor.sreg_maps is None:
+            print("sreg_map is none!!!!!")
+        else:
+            print("sreg_map is not none")
+        # attention_util.register_attention_control(self, editor, text_cond, clip_length, downsample_height,downsample_width,ddim_inversion=False, id_masks_by_res=id_masks_by_res)
+        attention_util.register_attention_control(self, editor, text_cond, clip_length, downsample_height,downsample_width,ddim_inversion=False, id_masks_by_res=id_masks_by_res)
         #============do visualization for st-layout attn===============#
 
         # editor = ST_Layout_Attn_Control(text_cond=text_cond,sreg_maps=sreg_maps,creg_maps=creg_maps,reg_sizes=reg_sizes,reg_sizes_c=reg_sizes_c,
@@ -753,6 +827,7 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
 
                     # inject features
                     if use_pnp and i < kwargs["inject_step"]:
+                        print("use pnp pnp pnp!")
                         self.unet.up_blocks[1].resnets[0].out_layers_inject_features = attn_inversion_dict['features0'][i].to(device)
                         self.unet.up_blocks[1].resnets[1].out_layers_inject_features = attn_inversion_dict['features1'][i].to(device)
                         self.unet.up_blocks[2].resnets[0].out_layers_inject_features = attn_inversion_dict['features2'][i].to(device)
@@ -812,6 +887,107 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
                     )
 
                     latents = latents * latent_mask + noise_source_latents * (1 - latent_mask)
+##########################################################################################################
+                    #                 # === 參數 ===
+                    # make_step_videos = False       # 是否每 5 步輸出影片
+                    # video_every = 5               # 每幾步輸出一次影片（50 步 → 每 5 步 1 支 → 共 10 支）
+                    # video_fps = 12                # 影片幀率
+                    # save_only_first_batch = True  # 只輸出 batch=0
+                    
+                    # # === 輸出資料夾（用 timestamp 避免覆蓋）===
+                    # run_tag = time.strftime("%Y%m%d-%H%M%S")
+                    # video_dir = os.path.join(logdir, f"denoise_videos")
+                    # os.makedirs(video_dir, exist_ok=True)
+                    
+                    # def _save_mp4(frames_np, out_path, fps=12):
+                    #     """
+                    #     frames_np: [T, H, W, C]，數值 0~1 或 0~255
+                    #     會自動轉成 uint8 再寫入 H.264 MP4
+                    #     """
+                    #     assert frames_np.ndim == 4 and frames_np.shape[-1] in (1, 3), f"unexpected: {frames_np.shape}"
+                    #     arr = frames_np
+                    #     if arr.dtype != np.uint8:
+                    #         arr = np.clip(arr, 0.0, 1.0) * 255.0
+                    #         arr = arr.astype(np.uint8)
+                    #     # 若是單通道，轉成 3 通道方便寫入
+                    #     if arr.shape[-1] == 1:
+                    #         arr = np.repeat(arr, 3, axis=-1)
+                    #     writer = imageio.get_writer(out_path, fps=fps, codec='libx264', quality=8)
+                    #     for f in range(arr.shape[0]):
+                    #         writer.append_data(arr[f])
+                    #     writer.close()
+                    #     # 取 VAE/UNet 的 dtype / device（可在迴圈外先算好）
+                    # # 取 VAE 的 dtype/device（放到循環外更好）
+                    # vae_device = next(self.vae.parameters()).device
+                    # vae_dtype  = next(self.vae.parameters()).dtype  # 常見 torch.float16
+                    
+                    # # 若你的 diffusers 版本支援，開啟 VAE slicing/tiling（放循環外執行一次）
+                    # try:
+                    #     if hasattr(self.vae, "enable_slicing"): self.vae.enable_slicing()
+                    #     if hasattr(self.vae, "enable_tiling"):  self.vae.enable_tiling()
+                    # except Exception:
+                    #     pass
+                    
+                    # # =====================  插入：每 5 步輸出 1 支影片（串流小塊解碼）  =====================
+                    # if make_step_videos and (video_every > 0) and ((i % video_every) == 0):
+                    #     import imageio.v2 as imageio
+                    #     import numpy as np
+                    #     from torch.cuda.amp import autocast
+                    
+                    #     with torch.inference_mode():
+                    #         latents_vis = latents[:1] if save_only_first_batch else latents     # [B,C,T,H,W]
+                    #         B, C, T, H, W = latents_vis.shape
+                    #         step_abs = int(len(time_steps) * blending_percentage) + i
+                    #         out_path = os.path.join(video_dir, f"video_step_{step_abs:04d}_b0.mp4")
+                    
+                    #         # 串流寫 MP4，不把整段影片放在 GPU/CPU 記憶體
+                    #         writer = imageio.get_writer(out_path, fps=video_fps, codec='libx264', quality=8)
+                    
+                    #         # 重要：按時間維分塊（例如每次解 4 幀），你可依 GPU 改 t_chunk=1/2/4/8
+                    #         t_chunk = 4
+                    
+                    #         for t0 in range(0, T, t_chunk):
+                    #             t1 = min(T, t0 + t_chunk)
+                    #             # 取 [B,C,tt,H,W] → [B*tt,C,H,W]
+                    #             x = latents_vis[:, :, t0:t1].contiguous()
+                    #             Btt = x.shape[0] * x.shape[2]
+                    #             x = x.permute(0, 2, 1, 3, 4).reshape(Btt, C, H, W)
+                    #             x = x.detach().to(device=vae_device, dtype=vae_dtype)
+                    
+                    #             # 在 VAE 精度下跑（舊版 torch 用 autocast(dtype=...)）
+                    #             try:
+                    #                 ctx = autocast(dtype=(torch.float16 if vae_dtype == torch.float16 else torch.bfloat16))
+                    #             except TypeError:
+                    #                 # 更舊版 torch 沒有 dtype 參數，直接關掉 AMP
+                    #                 class _Dummy:
+                    #                     def __enter__(self): pass
+                    #                     def __exit__(self, *a): pass
+                    #                 ctx = _Dummy()
+                    
+                    #             with ctx:
+                    #                 # 直接走 VAE.decode（不經你原本的 decode_latents 一次吃爆）
+                    #                 # diffusers VAE 輸出區間通常 [-1,1]，後處理到 [0,1]
+                    #                 dec = self.vae.decode(x).sample  # [B*tt,3,H,W]，dtype≈vae_dtype
+                    
+                    #             dec = dec.float()                    # 後處理用 fp32
+                    #             dec = (dec / 2 + 0.5).clamp(0, 1)    # [-1,1] → [0,1]
+                    #             dec = dec.permute(0, 2, 3, 1).cpu().numpy()  # [B*tt,H,W,C]
+                    
+                    #             # 只寫 batch=0 的幀（如果想全部 batch，就多一層 batch 邏輯）
+                    #             # 這裡由於我們已經把 B 合併進 B*tt，因此只需按 tt 順序寫
+                    #             for k in range(dec.shape[0]):
+                    #                 frame = (dec[k] * 255).astype(np.uint8)
+                    #                 if frame.shape[-1] == 1:
+                    #                     frame = np.repeat(frame, 3, axis=-1)
+                    #                 writer.append_data(frame)
+                    
+                    #             # 釋放 GPU 記憶體
+                    #             del x, dec
+                    #             torch.cuda.empty_cache()
+                    
+                    #         writer.close()
+                    #         print(f"[video] saved {out_path}")
+                    # # =====================  插入結束 =====================
 
                     # call the callback, if provided
                     if i == len(time_steps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):

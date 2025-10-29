@@ -31,18 +31,19 @@ class AttentionControl(abc.ABC):
         return 0
     
     @abc.abstractmethod
-    def forward (self, attn, is_cross: bool, place_in_unet: str):
+    def forward (self, attn, is_cross: bool, place_in_unet: str, height=None, width=None, clip_length=None):
         return attn
         # raise NotImplementedError
 
-    def __call__(self, attn, is_cross: bool, place_in_unet: str):
+    def __call__(self, attn, is_cross: bool, place_in_unet: str, height=None, width=None, clip_length=None):
+        # print("attentionControl __call__")
         if self.cur_att_layer >= self.num_uncond_att_layers:
             # For classifier-free guidance scale!=1
             #print("half forward")
             h = attn.shape[0]
             if h == 1:
                 #print("sliced attn")
-                attn = self.forward(attn, is_cross, place_in_unet)
+                attn = self.forward(attn, is_cross, place_in_unet, height, width, clip_length)
                 self.sliced_attn_head_count+=1
                 if self.sliced_attn_head_count == 8:
                     self.cur_att_layer += 1
@@ -84,7 +85,8 @@ class AttentionStore(AttentionControl):
                 "down_self": [],  "mid_self": [],  "up_self": []
                 }
 
-    def forward(self, attn, is_cross: bool, place_in_unet: str):
+    def forward(self, attn, is_cross: bool, place_in_unet: str, height=None, width=None, clip_length=None):
+        # print("attention store forward")
         key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
         if attn.shape[2] <= 32 ** 2:
             # if not is_cross:
@@ -92,13 +94,66 @@ class AttentionStore(AttentionControl):
                 self.step_store[key].append(copy.deepcopy(append_tensor))
 
         return attn
+    # def between_steps(self):
+    #     # [FIX] ---------- 第一次 step：用 deepcopy 建立獨立的 attention_store，避免別名 ----------
+    #     if len(self.attention_store) == 0:
+    #         self.attention_store = copy.deepcopy(self.step_store)  # [FIX]
+    #         self.step_store = self.get_empty_store()               # [FIX] 立刻重置，下一步重新累積
+    #         return
 
+    #     # （非第一個 step）先列印偵錯資訊（保留你的行為）
+    #     print("=== Keys in attention_store ===")
+    #     for key in self.attention_store:
+    #         print(f"  {key} : len={len(self.attention_store[key])}")
+    #     print("=== Keys in step_store ===")
+    #     for key in self.step_store:
+    #         print(f"  {key} : len={len(self.step_store[key])}")
+
+    #     # [FIX] ---------- 合併前：把兩邊 list 補齊到同長度 ----------
+    #     for key in self.attention_store:
+    #         base_list = self.attention_store[key]
+    #         step_list = self.step_store.get(key, [])
+
+    #         L_base = len(base_list)
+    #         L_step = len(step_list)
+
+    #         # a) 若本步少了某些層（這是最常見的情況；例如高解析度層沒記錄），
+    #         #    用 zeros_like(對應的 base tensor) 去「補」 step_list
+    #         if L_step < L_base:
+    #             for i in range(L_step, L_base):
+    #                 # 以歷史相同位置的 tensor 形狀為準產生 0
+    #                 z = torch.zeros_like(base_list[i])
+    #                 step_list.append(z)
+
+    #         # b) 若本步多了新層（通常不常見；但也做保護），補 attention_store
+    #         elif L_step > L_base:
+    #             for i in range(L_base, L_step):
+    #                 z = torch.zeros_like(step_list[i])
+    #                 base_list.append(z)
+
+    #         # 現在兩邊長度一致，可以安全逐項相加
+    #         for i in range(len(base_list)):
+    #             base_list[i] = base_list[i] + step_list[i]  # 不是 in-place，避免梯度/別名問題
+
+    #     # [FIX] ---------- 合併後重置本步緩存 ----------
+    #     self.step_store = self.get_empty_store()
     def between_steps(self):
         if len(self.attention_store) == 0:
             self.attention_store = self.step_store
         else:
+            # print("=== Keys in attention_store ===")
+            # for key in self.attention_store:
+            #     print(f"  {key} : len={len(self.attention_store[key])}")
+    
+            # print("=== Keys in step_store ===")
+            # for key in self.step_store:
+            #     print(f"  {key} : len={len(self.step_store[key])}")
+
+            
             for key in self.attention_store:
+   
                 for i in range(len(self.attention_store[key])):
+                    
                     self.attention_store[key][i] += self.step_store[key][i]
                     
         self.step_store = self.get_empty_store()
