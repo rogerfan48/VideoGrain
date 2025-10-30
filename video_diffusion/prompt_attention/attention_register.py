@@ -563,7 +563,7 @@ def register_attention_control(model, controller, text_cond, clip_length, height
 ################################################################################################              
             ##### 你要的設定：參考幀與交錯起點
             REF_FRAMES = list(range(0, 6))  # 0..5 幀
-            CROSS_START = 10  # 從第 6 幀開始視為交錯段
+            CROSS_START = 6  # 從第 6 幀開始視為交錯段
             record_after_softmax = True  # 統計 old/new 時是否記機率（維持你的原習慣）
     
             ###交換與縮放強度
