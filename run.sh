@@ -5,4 +5,4 @@ accelerate launch \
     --num_machines=1 \
     --mixed_precision=no \
     --dynamo_backend=no \
-    test.py --config config/cross_attn/ww_0915_super.yaml
+    test.py --config config/cross_attn/1112.yaml

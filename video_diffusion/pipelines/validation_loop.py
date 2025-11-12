@@ -121,6 +121,12 @@ class SampleLogger:
         image: Union[torch.FloatTensor, PIL.Image.Image] = None,
         masks: Union[torch.FloatTensor, PIL.Image.Image] = None,
         layouts : Union[torch.FloatTensor, PIL.Image.Image] = None,
+        dirty_A: list = None,
+        dirty_B: list = None,
+        clean_A: list = None,
+        clean_B: list = None,
+        part_masks: Union[torch.FloatTensor, PIL.Image.Image] = None,
+        part_layouts: Union[torch.FloatTensor, PIL.Image.Image] = None,
         latents: torch.FloatTensor = None,
         control: torch.FloatTensor = None,
         controlnet_conditioning_scale = None,
@@ -139,25 +145,49 @@ class SampleLogger:
         torch.cuda.empty_cache()
         samples_all = []
         attention_all = []
-        # handle input image
-        if image is not None:
-            input_pil_images = pipeline.numpy_to_pil(tensor_to_numpy(image))[0]
-            samples_all.append(input_pil_images)
+        print(image.shape) #torch.Size([15, 3, 512, 512]) ['Spiderman and Superman walking in opposite directions.', 'Spiderman', 'Superman']
+   
+        #############################################################
+        # num_frames = image.shape[0]
+        # prompts_schedule = []
+        # for f in range(num_frames):
+        #     if f < 6:
+        #         pidx = 0
+        #     elif f < 16:
+        #         pidx = 1 if len(self.editing_prompts) > 1 else 0
+        #     else:
+        #         pidx = min(len(self.editing_prompts) - 1, 1)  # >=16 幀仍用第二個（若有）
+        #     prompts_schedule.append(self.editing_prompts[pidx])
+
+            
+        # # handle input image
+        # if image is not None:
+        #     input_pil_images = pipeline.numpy_to_pil(tensor_to_numpy(image))[0]
+        #     samples_all.append(input_pil_images)
+
+                
+        #############################################################
             # samples_all.append([
             #                 annotate_image(image, "input sequence", font_size=self.annotate_size) for image in input_pil_images
             #             ])
         #masks_all, layouts_all = self.read_layout_and_merge_masks()
-        #for idx, (prompt, masks, layouts) in enumerate(tqdm(zip(self.editing_prompts, masks_all, layouts_all), desc="Generating sample images")):
+        # for idx, (prompt, masks, layouts) in enumerate(tqdm(zip(self.editing_prompts, masks_all, layouts_all), desc="Generating sample images")):
         for idx, prompt in enumerate(tqdm(self.editing_prompts, desc="Generating sample images", disable=True)):
+            print(prompt)
             for seed in self.sample_seeds:
                 generator = torch.Generator(device=device)
                 generator.manual_seed(seed)
                 print("pipeline start !!!")
                 sequence_return = pipeline(
                     prompt=prompt,
-                    image=image, # torch.Size([8, 3, 512, 512])
+                    image=image, # torch.Size([15, 3, 512, 512])
                     latent_mask=masks,
                     layouts = layouts,
+                    dirty_A = dirty_A,
+                    dirty_B = dirty_B,
+                    clean_A = clean_A,
+                    clean_B = clean_B,                   
+                    part_layouts = part_layouts,
                     strength=self.strength,
                     generator=generator,
                     num_inference_steps=self.num_inference_steps,
@@ -184,22 +214,55 @@ class SampleLogger:
                     vis_frames=self.vis_frames,
                     **{"disable_progress_bar": True} 
                 )
-
+        # ===== 依 seed 產生影片；每次呼叫 pipeline 一次，prompt 傳入 per-frame list =====
+        # for seed in self.sample_seeds:
+        #     generator = torch.Generator(device=device)
+        #     generator.manual_seed(seed)
+    
+        #     sequence_return = pipeline(
+        #         prompt=prompts_schedule,            # ← 這裡是重點：每幀一個 prompt
+        #         image=image,                        # e.g. torch.Size([F, 3, 512, 512]) 或 PIL list
+        #         latent_mask=masks,
+        #         layouts=layouts,
+        #         strength=self.strength,
+        #         generator=generator,
+        #         num_inference_steps=self.num_inference_steps,
+        #         clip_length=self.clip_length,       # 與 num_frames 對齊
+        #         guidance_scale=self.guidance_scale,
+        #         num_images_per_prompt=1,
+    
+        #         # null-inversion / control 相關
+        #         control=control,
+        #         controlnet_conditioning_scale=controlnet_conditioning_scale,
+        #         latents=latents,
+        #         blending_percentage=blending_percentage,
+        #         logdir=self.logdir,
+        #         trajs=trajs,
+        #         flatten_res=flatten_res,
+        #         negative_prompt=negative_prompt,
+        #         source_prompt=source_prompt,
+        #         inject_step=inject_step,
+        #         old_qk=old_qk,
+        #         use_pnp=use_pnp,
+        #         cluster_inversion_feature=cluster_inversion_feature,
+        #         vis_cross_attn=vis_cross_attn,
+        #         attn_inversion_dict=attn_inversion_dict,
+        #     )
                 sequence = sequence_return.images[0]
                 torch.cuda.empty_cache()
-
+    
                 if self.annotate:
                     images = [
                         annotate_image(image, prompt, font_size=self.annotate_size) for image in sequence
                     ]
                 else:
                     images = sequence
-
+    
                 if self.make_grid:
                     samples_all.append(images)
                 save_path = os.path.join(self.logdir, f"step_{step}_{idx}_{seed}.gif")
                 save_gif_mp4_folder_type(images, save_path)
-        
+    
         if self.make_grid:
             samples_all = [make_grid(images, cols=int(np.ceil(np.sqrt(len(samples_all))))) for images in zip(*samples_all)]
             save_path = os.path.join(self.logdir, f"step_{step}.gif")
