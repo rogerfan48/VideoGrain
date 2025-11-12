@@ -489,7 +489,130 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
                                                         attention_type = "FullyFrameAttention"
         #print("attention_type:",attention_type)
         return attention_type
+    def _to_uint8(self, img01: torch.Tensor) -> np.ndarray:
+        """
+        img01: [H,W] in {0,1} or [H,W] float in [0,1]
+        return uint8 [H,W] in {0,255}
+        """
+        img01 = img01.clamp(0, 1)
+        return (img01 * 255.0).round().to(torch.uint8).cpu().numpy()
     
+    def _save_png(self, arr_uint8: np.ndarray, path: str, palette=None):
+        """
+        Save uint8 2D array as PNG. If palette provided (list of 768 ints),
+        will store as 'P' mode (indexed color).
+        """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if palette is None:
+            Image.fromarray(arr_uint8).save(path)
+        else:
+            im = Image.fromarray(arr_uint8, mode="P")
+            im.putpalette(palette)
+            im.save(path)
+    
+    def _make_simple_palette(self, num_classes: int) -> list:
+        """
+        Make a simple color palette for 'P' mode. Repeats if >8, but for你現在的2~3類足夠。
+        """
+        base = [
+            (0,0,0),        # 0: bg - black
+            (255,0,0),      # 1: red
+            (0,255,0),      # 2: green
+            (0,0,255),      # 3: blue
+            (255,255,0),    # 4: yellow
+            (255,0,255),    # 5: magenta
+            (0,255,255),    # 6: cyan
+            (255,128,0),    # 7: orange
+        ]
+        colors = []
+        for i in range(num_classes):
+            colors.append(base[i % len(base)])
+        # palette needs length 256*3; pad with zeros
+        flat = []
+        for (r,g,b) in colors:
+            flat += [r,g,b]
+        flat += [0,0,0] * (256 - len(colors))
+        return flat
+    # [NEW] 找主提示中完整連續匹配的所有區段（回傳 [(j0,j1), ...]）
+    def _find_all_spans(self, main_ids: torch.Tensor, sub_ids: torch.Tensor, max_len: int = 77):
+        hits = []
+        L = int(sub_ids.numel())
+        if L <= 0 or L > max_len:
+            return hits
+        for j in range(max_len - L + 1):
+            if (main_ids[j:j+L] == sub_ids).sum() == L:
+                hits.append((j, j+L))
+        return hits
+    
+    # [NEW] 互斥：m1' = m1 & ~m2，m2' = m2 & ~m1（簡版）
+    def _disjoin_pair(self, m1: torch.Tensor, m2: torch.Tensor):
+        return (m1 & (~m2)), (m2 & (~m1))
+    def _ensure_dir(self, path: str):
+        os.makedirs(path, exist_ok=True)
+        return path
+    
+    def save_labels_memmap(self, labels: torch.Tensor, save_path: str):
+        """
+        labels: [N] int16/uint16 on CPU/GPU
+        save_path: file path (e.g., ./sreg_labels/frame_000.npy or .dat)
+        """
+        labels_cpu = labels.detach().to(torch.int32).cpu().numpy().astype(np.uint16)
+        self._ensure_dir(os.path.dirname(save_path))
+        # 使用 memmap 建檔（w+ 會新建/覆蓋；也可用 np.save 但 memmap 更好做大批處理）
+        mm = np.memmap(save_path, dtype=np.uint16, mode='w+', shape=(labels_cpu.shape[0],))
+        mm[:] = labels_cpu[:]
+        del mm  # 關閉映射（確保 flush）
+    
+    def load_labels_memmap(self, load_path: str) -> torch.Tensor:
+        """
+        回傳 CPU tensor（呼叫端自行 .to(device)）
+        """
+        mm = np.memmap(load_path, dtype=np.uint16, mode='r')
+        # 這裡 copy() 是為了切斷對 memmap 的長期連結（也可不 copy，視你流程）
+        return torch.from_numpy(np.array(mm, copy=True)).to(torch.int32)
+    
+    def apply_sreg_mask_logits_chunk(
+        self,
+        logits_chunk: torch.Tensor,   # [Bxh, Q, N]
+        q_indices: torch.Tensor,      # [Q]
+        key_labels: torch.Tensor,     # [N]
+        big_neg: float = -1e3,
+        bg_id: int = 0                # [# MOD-APPLY] 我們這版 0 當背景；若你用哨兵，改成 65535
+    ):
+        """
+        僅允許「非背景」且「同類」互看；其他一律加大負偏置。
+        """
+        device = logits_chunk.device
+        key_labels = key_labels.to(device)            # [N]
+        q_labels = key_labels[q_indices]              # [Q]
+    
+        same_class = (q_labels.view(-1, 1) == key_labels.view(1, -1))  # [Q, N] bool
+    
+        # 不讓背景互看（query/key 若為背景，都視為不合法）
+        not_bg_q   = (q_labels.view(-1, 1) != bg_id)
+        not_bg_key = (key_labels.view(1, -1) != bg_id)
+        valid = same_class & not_bg_q & not_bg_key
+    
+        mask = (~valid).to(logits_chunk.dtype) * big_neg
+        return logits_chunk + mask
+    def _downsample_two_instances_to_64x64(self, li_full: torch.Tensor, out_hw=(64, 64), thr: float = 0.5):
+        """
+        li_full: [2, H, W] 兩個 instance 的 mask（0/1 或機率）
+        回傳: li_64: [2, 64, 64]，先 hard 化再 max-pool，保留小面積
+        """
+        assert li_full.dim() == 3 and li_full.shape[0] == 2, f"Expect [2,H,W], got {tuple(li_full.shape)}"
+        # 先 hard 化
+        hard = (li_full > thr).float()                    # [2,H,W]
+        H, W = hard.shape[-2:]
+        oh, ow = out_hw
+        # 計算整數縮放比（若 H/W 不是 64 的整數倍，改用 interpolate 最近鄰）
+        if H % oh == 0 and W % ow == 0:
+            kh, kw = H // oh, W // ow
+            li_64 = F.max_pool2d(hard.unsqueeze(0), kernel_size=(kh, kw), stride=(kh, kw)).squeeze(0)  # [2,64,64]
+        else:
+            # 後備：最近鄰下採樣（相對不如 max-pool 穩，但仍可用）
+            li_64 = F.interpolate(hard.unsqueeze(0), size=(oh, ow), mode='nearest').squeeze(0)         # [2,64,64]
+        return li_64
     # ==== [REPLACE FROM HERE] ===============================================
     def _excel_letters(self, n: int) -> str:
         """0 -> 'a', 1 -> 'b', ... 25 -> 'z', 26 -> 'aa', ... (lowercase)."""
@@ -543,7 +666,21 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         # === 🔵 新增：分 class 的 sreg 與尺寸比例 ===
         sreg_maps_class = {}   # key: Q (=h*w) ; val: [bsz, 1, Q, Q, C]  (C = seg_cls or seg_cls+1 with BG)
         reg_sizes_class = {}   # key: Q ; val: [bsz, 1, 1, 1, C]
- 
+        # >>> [ADDED]：part_layouts（S-head / B-head）初始化（不改回傳，掛在 self 上）
+        # part_masks_by_res = {}   # 結構：self.part_masks_by_res[h*w] = {'S_head': [F,H,W], 'B_head': [F,H,W]}
+        
+        # >>> [ADDED]：part 的通道定義（確保 0= S_head, 1= B_head）
+        # part_id_map = {'S_head': 0, 'B_head': 1}
+        # # >>> [ADDED]：基本形狀檢查（允許 part_layouts 缺席）
+        # has_part = (part_layouts is not None)
+        # if has_part:
+        #     try:
+        #         frames_p, seg_part_cls, c_p, h_p, w_p = part_layouts.shape
+        #         if frames_p != frames:
+        #             print(f"[WARN] part_layouts frames({frames_p}) != layouts frames({frames})，後續仍以 layouts 的 frames 為準")
+        #     except Exception as e:
+        #         print(f"[WARN] part_layouts 形狀解析失敗：{e}")
+        #         has_part = False     
                 
         device = layouts.device
 
@@ -601,6 +738,31 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
                             print(f"      {subk}: shape={tuple(subv.shape)} dtype={subv.dtype}")
                         else:
                             print(f"      {subk}: type={type(subv)}")
+            # if has_part:
+            #     # 以與 layouts 相同的解析度 (h, w) 做最近鄰下採樣
+            #     # part_layouts: [F, S_part, 1, H, W]  → squeeze(2)→ [F, S_part, H, W]
+            #     part_interp_flat = F.interpolate(part_layouts.squeeze(2), (h, w), mode='nearest').unsqueeze(2)  # [F,S_part,1,h,w]
+            #     # 二值化後展回 [F, S_part, h, w]
+            #     part_mask_hw = (part_interp_flat.squeeze(2) > 0).to(torch.float32).view(-1, seg_part_cls, h, w)  # [F,S_part,h,w]
+            
+            #     # 取出 S-head / B-head；若通道不足則回退為 0
+            #     if seg_part_cls > part_id_map['S_head']:
+            #         S_head_stack = part_mask_hw[:, part_id_map['S_head']]     # [F,h,w]
+            #     else:
+            #         S_head_stack = torch.zeros((frames, h, w), device=part_mask_hw.device)
+            
+            #     if seg_part_cls > part_id_map['B_head']:
+            #         B_head_stack = part_mask_hw[:, part_id_map['B_head']]     # [F,h,w]
+            #     else:
+            #         B_head_stack = torch.zeros((frames, h, w), device=part_mask_hw.device)
+            
+            #     # 存到 self.part_masks_by_res[h*w]
+            #     part_masks_by_res[h * w] = {
+            #         'S_head': [S_head_stack[t].contiguous() for t in range(frames)],
+            #         'B_head': [B_head_stack[t].contiguous() for t in range(frames)],
+            #     }
+            # ===================== /part_layouts ======================
+
         
             ### implementation of sparse casual attn and fully frame attn
             for i in range(frames):
@@ -633,7 +795,19 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
                 sreg_maps[h*w] = layouts_s_sparse_attn
                 reg_sizes[h*w] = 1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(clip_length, 2))
                 reg_sizes_c[h*w]  = 1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(clip_length, 2))
+            #### code for check error#####
+            # num_nonzero = torch.count_nonzero(layouts_s_frames)
+            # print("num_nonzero",num_nonzero)
+            # print("layouts_s_frames",layouts_s_frames.shape)
+            # print("layouts_s_frames",layouts_s_frames)
+            # print("reg_size final shape:", (1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(res, 2))).shape)
+            # print("reg_size", (1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(res, 2))))
+            #### code for check error#####
 
+
+            #print("layouts_s",layouts_s.shape)
+
+            #print("layouts_s.view(layouts_s.size(0),-1,1)",*layouts_s.view(layouts_s.size(0),-1,1).shape)
 
             if attention_type == "FullyFrameAttention":
                 layouts_s= rearrange(layouts_interpolate,"f s c res -> s c (f res)")
@@ -647,7 +821,59 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
                     sreg_maps[h*w] = layouts_s
                     reg_sizes[h*w] = 1-1.*layouts_s.sum(-1, keepdim=True)/((h*clip_length)*(w*clip_length))
                     reg_sizes_c[h*w]  =  1-1.*layouts_s_frames.sum(-1, keepdim=True)/(h*w)
-                #print("layouts_s",layouts_s.shape)    
+                #print("layouts_s",layouts_s.shape)
+                # if res == 64:
+                #     reg_sizes[np.power(res, 2)] = None
+                # else:
+                #     reg_sizes[np.power(res, 2)] = 1-1.*layouts_s.sum(-1, keepdim=True)/(np.power(res*clip_length, 2))
+                # #sreg_maps[np.power(res, 2)] = layouts_s_frames
+                # sreg_maps[np.power(res, 2)] = layouts_s
+                # reg_sizes_c[np.power(res, 2)]  =  1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(res, 2))
+            # =====================================================================
+            # === 🔵 新增：分 class 的 sreg（含 BG） -> sreg_maps_class / reg_sizes_class ===
+            # 目標：得到 [bsz, 1, Q, Q, C] 以及 [bsz, 1, 1, 1, C]
+            # 做法（省顯存）：
+            #   1) 先在每幀、每類別維度上用 bool masks（[h_r, w_r]）
+            #   2) 以「跨幀 union」得到每類別在該尺度的 union 像素集合 v_c ∈ {0,1}^Q
+            #   3) 再計算外積 v_c v_c^T 形成 [Q,Q]（或以 (V @ V.T)>0 得一張合併遮罩）；最後多一個 BG 通道
+            # =====================================================================
+    
+            # 2-1) 收集 per-class union 像素（跨幀 OR）
+            #      V: [Q, seg_cls]，bool
+            # V_list = []
+            # for s in range(seg_cls):
+            #     # union over frames: [F, h_r, w_r] -> [h_r, w_r] -> reshape(-1)==Q
+            #     # layouts_interp_hw: [F, S, 1, h_r, w_r]
+            #     cls_union_hw = (layouts_interp_hw[:, s, 0] > 0)  # bool, [F, h_r, w_r]
+            #     cls_union_hw = cls_union_hw.any(dim=0)          # [h_r, w_r]
+            #     V_list.append(cls_union_hw.reshape(-1))         # [Q]
+    
+            # V = torch.stack(V_list, dim=1)  # [Q, seg_cls], bool
+    
+            # # 2-2) 背景通道 BG = ~(A ∪ B ∪ ...)，bool
+            # union_all = V.any(dim=1)               # [Q]
+            # bg_vec = ~union_all                    # [Q]
+            # # 拼成 [Q, C]（C = seg_cls + 1）
+            # VC = torch.cat([V, bg_vec.unsqueeze(1)], dim=1)  # [Q, C]
+            # C = VC.shape[1]
+    
+            # # 2-3) reg_sizes_class：各通道像素占比（[bsz,1,1,1,C]）
+            # reg_sizes_vec = VC.float().mean(dim=0)  # [C]
+            # reg_sizes_class[Q] = reg_sizes_vec.view(1, 1, 1, 1, C).expand(bsz, 1, 1, 1, C).contiguous()
+    
+            # # 2-4) sreg_maps_class：把每個通道展成外積（必要時才 materialize）
+            # #     這裡給出完整 [bsz,1,Q,Q,C]，dtype=bool 以省顯存（後面用時可轉 float）
+            # sreg_qkc_list = []
+            # VC_bool = VC  # [Q, C], bool
+            # for cidx in range(C):
+            #     v = VC_bool[:, cidx]              # [Q], bool
+            #     outer_c = (v[:, None] & v[None, :])  # [Q, Q], bool
+            #     sreg_qkc_list.append(outer_c)
+    
+            # sreg_qkc = torch.stack(sreg_qkc_list, dim=-1)  # [Q, Q, C], bool
+            # sreg_maps_class[Q] = sreg_qkc.unsqueeze(0).unsqueeze(0).expand(bsz, 1, Q, Q, C).contiguous()  # [bsz,1,Q,Q,C], bool
+    
+            # === 🔵 新增結束 ===          
             
         ###########################
         ###### prep for creg ######
@@ -689,6 +915,449 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         return text_cond, sreg_maps, creg_maps, reg_sizes, reg_sizes_c, sreg_maps_class, reg_sizes_class, id_masks_by_res
 
 
+### original + 64*64
+#     def _prepare_attention_layout(self,bsz,height,width,layouts,prompts,clip_length,attention_type,device):
+#         print("start prepare attention layout")
+#         ## current layouts  f s c h w
+#         ## org layouts s c h w
+            
+#         #print("prompt:",prompts)
+#         # sp_sz =self.unet.sample_size
+#         sp_sz = height*width
+#         frames, seg_cls, c, h ,w = layouts.shape
+#         text_input = self.tokenizer(prompts, padding="max_length", return_length=True, return_overflowing_tokens=False, 
+#                                     max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
+#         cond_embeddings = self.text_encoder(text_input.input_ids.to(device))[0]
+
+#         uncond_input = self.tokenizer([""]*bsz, padding="max_length", max_length=self.tokenizer.model_max_length,
+#                                     truncation=True, return_tensors="pt")
+#         uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(device))[0]
+
+#         for i in range(1,len(prompts)):
+#             wlen = text_input['length'][i] - 2
+#             widx = text_input['input_ids'][i][1:1+wlen]
+#             for j in range(77):
+#                 if (text_input['input_ids'][0][j:j+wlen] == widx).sum() == wlen:
+#                     break
+
+#         ###########################
+#         ###### prep for sreg ###### 
+#         ###########################
+      
+#         sreg_maps = {}
+#         reg_sizes = {}
+#         reg_sizes_c = {}
+
+#         device = layouts.device
+
+#         frame_index_pre = torch.arange(frames)+(-1)
+#         frame_index_pre = frame_index_pre.clip(0, frames-1)
+
+#          # === [NEW] 初始化 id_maps：存 per-scale 的 id_flat ===
+#         id_maps = {}       
+
+
+        
+#         # [MOD-LABELS-64] 新增：labels 檔案存放資料夾（可依需求改）
+#         # ----------------------------------------------------------
+#         labels_root = self._ensure_dir("./sreg_labels_Roger")  # <--- [MOD-LABELS-64] 新增
+#         debug_dir = self._ensure_dir("./debug_masks")
+
+
+#         # ========================= 視覺化：原始輸入 layouts（可選） =========================
+#         # [VIS-RAW-START] 直接從輸入 layouts 存圖（H=W=原尺寸），幫你確認「第二維通道」逐幀變化
+#         debug_vis = True
+#         if debug_vis:
+#             raw_out_dir = os.path.join(debug_dir, "r_raw_input_{}x{}".format(h, w))
+#             pal = self._make_simple_palette(seg_cls + 1)  # 用於語意彩圖
+#             with torch.no_grad():
+#                 # binary masks by class
+#                 for f in range(frames):
+#                     # layouts[f]: [seg_cls, c, h, w]，通常 c==1
+#                     li = layouts[f, :, 0]  # [seg_cls, h, w]
+#                     # 存各 class 的二值圖
+#                     for s in range(seg_cls):
+#                         m = (li[s] > 0.5).float()     # 二值化
+#                         self._save_png(self._to_uint8(m), os.path.join(raw_out_dir, f"frame_{f:03d}_cls{s}.png"))
+
+#                     # 再存 argmax 語意彩色圖
+#                     # 先把 [seg_cls,H,W] 轉到 [H,W] 的類別ID（0=背景）
+#                     # 這裡以最大值類別當成ID，沒有重疊時可以快速看翻轉
+#                     score = li  # 假設 li 已是 [0,1] mask；如有 logits 可改 soft
+#                     arg = score.argmax(dim=0) + 1  # 1..seg_cls；0保留給背景
+#                     bg = (score.max(dim=0).values <= 0.5)
+#                     arg[bg] = 0
+#                     self._save_png(arg.to(torch.uint8).cpu().numpy(), os.path.join(raw_out_dir, f"frame_{f:03d}_colormap.png"), palette=pal)
+#         # ----------------------------------------------------------
+#         for r in range(4):
+#             layouts_s_frames = []
+#             if attention_type == "SparseCausalAttention":
+#                 layouts_s_sparse_attn = []
+#             import numpy as np
+#             h = int(height/np.power(2,r))
+#             w= int(width/np.power(2,r))
+#             #layouts torch.Size([70, 2, 1, 64, 64])
+#             # layouts_interpolate = F.interpolate(layouts.squeeze(2), (res, res), mode='nearest').unsqueeze(2)    
+#             layouts_interpolate = F.interpolate(layouts.squeeze(2), (h, w), mode='nearest').unsqueeze(2)  
+#             layouts_interpolate_2d = layouts_interpolate
+#             layouts_interpolate = layouts_interpolate.view(frames,seg_cls,1,-1)   ## frames,seg_cls,1,res^2
+          
+#             # === [NEW] 建立 this-scale 的 id_flat: 0=bg, 1=spiderman, 2=bear ===
+#             # 假設 layouts_interpolate[:,0,0] = Spiderman mask, layouts_interpolate[:,1,0] = PolarBear mask
+#             sp_mask = (layouts_interpolate_2d [:, 0, 0] > 0)  # [F,h_r,w_r]
+#             br_mask = (layouts_interpolate_2d [:, 1, 0] > 0)  # [F,h_r,w_r]
+#             ids = torch.zeros((frames, h, w), dtype=torch.long, device=device)
+#             ids[sp_mask] = 2
+#             ids[br_mask] = 1
+#             id_flat = ids.reshape(-1)  # 長度 = frames*h_r*w_r (frame-major 展平)
+#             # 存兩種 key，避免混淆
+#             id_maps[(h, w, frames)] = id_flat
+#             id_maps[h * w] = id_flat
+
+# ####################################################
+#             h_r = h
+#             w_r = w
+#             N_r = h_r*w_r
+#         # ========================= 64×64 分支 =========================
+#             if h_r == 64 and w_r == 64:
+#                 # [# MOD-CORE] 這裡把「2 個 instance 通道」轉成 3 類 labels：0 背景、1 左人、2 右人
+#                 label_file_paths = []
+#                 for i in range(frames):
+#                     # li_i: [seg_cls, 1, N]  -> squeeze -> [seg_cls, N]
+#                     li_i = layouts_interpolate[i].squeeze(1)   # [S, N]，S==2（左/右）
+#                     S, N = li_i.shape
+#                     assert S == 2, f"[64x64] Expect seg_cls==2 (two instances), got {S}"
+    
+#                     # ---- 把 li_i 還原回 [2,64,64] 做穩定下採樣與 hard 化 ----
+#                     li_full = li_i.view(S, 64, 64)             # 已經是 64×64（若上層非整數倍，請改走 _downsample_two_instances_to_64x64）
+#                     li_64   = self._downsample_two_instances_to_64x64(li_full, out_hw=(64, 64), thr=0.5)  # [2,64,64]
+#                     li      = li_64.view(S, -1)                # [2,4096]
+    
+#                     # ---- 建立 3 類 labels ----
+#                     thr = 0.5
+#                     left  = (li[0] > thr)
+#                     right = (li[1] > thr)
+    
+#                     labels = torch.zeros(N, dtype=torch.int32, device=li.device)   # 0=背景
+#                     labels[left]  = 1
+#                     labels[right] = 2
+    
+#                     # 解決下採樣造成的重疊：誰分數大就歸誰
+#                     both = left & right
+#                     if both.any():
+#                         labels[both] = torch.where(
+#                             li[0, both] >= li[1, both],
+#                             torch.tensor(1, device=li.device, dtype=torch.int32),
+#                             torch.tensor(2, device=li.device, dtype=torch.int32),
+#                         )
+    
+#                     # ---- 存檔 ----
+#                     save_path = os.path.join(labels_root, f"labels_f{i:03d}_64x64.dat")
+#                     self.save_labels_memmap(labels, save_path)
+#                     label_file_paths.append(save_path)
+    
+#                 # 記錄「labels 模式」的 sreg
+#                 sreg_maps[N_r] = {
+#                     "mode": "labels_memmap",
+#                     "paths": label_file_paths,
+#                     "H": h_r, "W": w_r, "N": N_r,
+#                     "classes": 3,   # 0=bg,1=left,2=right（給下游參考）
+#                 }
+#                 reg_sizes[N_r] = None
+#                 reg_sizes_c[N_r] = None
+    
+#                 # 64×64 不建 dense（避免 OOM）
+#                 continue
+#         # ======================= /64×64 分支 =======================
+# ####################################################
+#     ###################################################################################
+#             # bg_idx = seg_cls - 1
+#             # fg_idx = [i for i in range(seg_cls) if i != bg_idx]
+#             # def _union_fg_with_bg(li_frame):
+#             #     """
+#             #     li_frame: (seg_cls, 1, h*w)  單幀、單解析度的扁平化 mask
+            #     回傳:     (seg_cls, 1, h*w)  將每個前景通道加上背景（clamp 到 {0,1}）
+            #     """
+            #     # li_frame 是 0/1 mask；若是浮點，可直接相加再 clamp
+            #     bg = li_frame[bg_idx:bg_idx+1]              # (1,1,N)
+            #     li_frame[fg_idx] = torch.clamp(li_frame[fg_idx] + bg, max=1.0)
+            
+            #     # 可選：避免背景自己也形成 block（通常不希望背景彼此強連通）
+            #     li_frame[bg_idx] = 0.0 * li_frame[bg_idx]
+            #     return li_frame
+    
+    ###################################################################################
+            ### implementation of sparse casual attn and fully frame attn
+        #     for i in range(frames):
+        #         #layouts_f = layouts[i]
+
+        #         layouts_s = layouts_interpolate[i]
+
+        #         if attention_type == "SparseCausalAttention":
+                
+        #             ### prepare for SparseCausalAttention query, key/value
+        #             query= layouts_s
+        #             query = query.view(query.size(0),-1,1).to(device)  ### segcls,res^2,1  #[cls, 4096, 1]
+        
+        #             ### key should be segcls,1,2xres^2
+        #             key = torch.cat((layouts_interpolate[0],layouts_interpolate[frame_index_pre[i]]),dim=-1).to(device)
+        #             #([cls, 1, 8192])
+
+        #             layouts_s_cross_frame_attn= (query * key).sum(0).unsqueeze(0).repeat(bsz,1,1)  ## 1,4096,8192
+
+        #             layouts_s_sparse_attn.append(layouts_s_cross_frame_attn)
+                
+        #         layouts_s = (layouts_s.view(layouts_s.size(0),1,-1)*layouts_s.view(layouts_s.size(0),-1,1)).sum(0).unsqueeze(0).repeat(bsz,1,1)
+
+        #         layouts_s_frames.append(layouts_s)
+
+
+        #     layouts_s_frames = torch.stack(layouts_s_frames,dim=0)
+        #     if attention_type == "SparseCausalAttention":
+        #         layouts_s_sparse_attn = torch.stack(layouts_s_sparse_attn,dim=0)
+        #         sreg_maps[h*w] = layouts_s_sparse_attn
+        #         reg_sizes[h*w] = 1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(clip_length, 2))
+        #         reg_sizes_c[h*w]  = 1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(clip_length, 2))
+        #     #### code for check error#####
+        #     # num_nonzero = torch.count_nonzero(layouts_s_frames)
+        #     # print("num_nonzero",num_nonzero)
+        #     # print("layouts_s_frames",layouts_s_frames.shape)
+        #     # print("layouts_s_frames",layouts_s_frames)
+        #     # print("reg_size final shape:", (1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(res, 2))).shape)
+        #     # print("reg_size", (1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(res, 2))))
+        #     #### code for check error#####
+
+
+        #     #print("layouts_s",layouts_s.shape)
+
+        #     #print("layouts_s.view(layouts_s.size(0),-1,1)",*layouts_s.view(layouts_s.size(0),-1,1).shape)
+
+        #     if attention_type == "FullyFrameAttention":
+        #         layouts_s= rearrange(layouts_interpolate,"f s c res -> s c (f res)")  #layouts_s torch.Size([2, 1, 61440])
+        #         ####################################################
+        #         # layouts_s = _union_fg_with_bg(layouts_s)
+        #         ####################################################
+        #         if r==0:
+        #             layout_s = None
+        #             reg_sizes[h*w] = None
+        #             sreg_maps[h*w] = None
+        #             reg_sizes_c[h*w] = None
+        #             print("layout mask order check:")
+        #             print("mask[0][0] nonzero:", (layouts[0,0,0]>0).sum().item(), "  -> Spider candidate")
+        #             print("mask[0][1] nonzero:", (layouts[0,1,0]>0).sum().item(), "  -> Bear candidate")
+        #         else:
+        #             layouts_s = (layouts_s*layouts_s.view(layouts_s.size(0),-1,1)).sum(0).unsqueeze(0).repeat(bsz,1,1).to(torch.float16) #layouts_s torch.Size([1, 15360, 15360]) for h,w=32
+        #             sreg_maps[h*w] = layouts_s
+        #             reg_sizes[h*w] = 1-1.*layouts_s.sum(-1, keepdim=True)/((h*clip_length)*(w*clip_length))
+        #             reg_sizes_c[h*w]  =  1-1.*layouts_s_frames.sum(-1, keepdim=True)/(h*w)
+
+        #         # layouts_s = (layouts_s*layouts_s.view(layouts_s.size(0),-1,1)).sum(0).unsqueeze(0).repeat(bsz,1,1).to(torch.float16) #layouts_s torch.Size([1, 15360, 15360])
+        #         # sreg_maps[h*w] = layouts_s
+        #         # reg_sizes[h*w] = 1-1.*layouts_s.sum(-1, keepdim=True)/((h*clip_length)*(w*clip_length))
+        #         # reg_sizes_c[h*w]  =  1-1.*layouts_s_frames.sum(-1, keepdim=True)/(h*w)     
+        #         ###################################################   
+        #         # if res == 64:
+        #         #     reg_sizes[np.power(res, 2)] = None
+        #         # else:
+        #         #     reg_sizes[np.power(res, 2)] = 1-1.*layouts_s.sum(-1, keepdim=True)/(np.power(res*clip_length, 2))
+        #         # #sreg_maps[np.power(res, 2)] = layouts_s_frames
+        #         # sreg_maps[np.power(res, 2)] = layouts_s
+        #         # reg_sizes_c[np.power(res, 2)]  =  1-1.*layouts_s_frames.sum(-1, keepdim=True)/(np.power(res, 2))
+            
+            
+        # ###########################
+        # ###### prep for creg ######
+        # ###########################
+        # pww_maps = torch.zeros(frames, 1, 77, height, width).to(device)
+        # for i in range(1,len(prompts)):
+        #     wlen = text_input['length'][i] - 2
+        #     widx = text_input['input_ids'][i][1:1+wlen]
+        #     for j in range(77):
+        #         if (text_input['input_ids'][0][j:j+wlen] == widx).sum() == wlen:
+        #             for f in range(frames):
+        #                 pww_maps[f,:,j:j+wlen,:,:] = layouts[f,i-1:i]    # frames, seg_cls, c, h ,w = layouts.shape
+        #             cond_embeddings[0][j:j+wlen] = cond_embeddings[i][1:1+wlen]
+        #             print(prompts[i], i, '-th segment is handled.')
+        #             break
+        
+        # # print("cond_embeddings",cond_embeddings)
+        # creg_maps = {}
+        # for r in range(4):
+        #     pww_maps_frames = []
+        #     h = int(height/np.power(2,r))
+        #     w = int(width/np.power(2,r))
+        #     for i in range(frames):
+        #         pww_map_frame = pww_maps[i]
+        #         pww_map_frame.view(1,77,height,width)
+        #         pww_map_frame = F.interpolate(pww_map_frame, (h, w), mode='nearest')
+        #         pww_map_frame = pww_map_frame.view(1, 77, -1).permute(0, 2, 1).repeat(bsz,1,1)  # 重新调整形状
+        #         pww_maps_frames.append(pww_map_frame)
+        #     # 使用 torch.cat 连接处理后的所有帧
+        #     layout_c = torch.stack(pww_maps_frames, dim=0)
+        #     # print("layout_c",layout_c)
+        #     creg_maps[h*w] = layout_c
+
+        # ###########################    
+        # #### prep for text_emb ####
+        # ###########################
+        # # text_cond = torch.cat([uncond_embeddings, cond_embeddings[:1].repeat(bsz,1,1)])
+
+
+        # # # ========= 【新增】Mask→Prompt 標記 + 輸出影片 =========
+        # # try:
+        # #     import cv2
+        # #     import numpy as np
+        # #     from datetime import datetime
+
+        # #     viz_out_dir = self._ensure_dir(os.path.join(debug_dir, "viz_mask_prompt"))
+        # #     run_tag = datetime.now().strftime("%Y%m%d-%H%M%S")
+        # #     out_png_dir = self._ensure_dir(os.path.join(viz_out_dir, f"frames_{height}x{width}_{run_tag}"))
+        # #     out_mp4_path = os.path.join(viz_out_dir, f"mask_prompt_{height}x{width}_{run_tag}.mp4")
+
+        # #     # 1) 準備「通道 → 文字」的對應（按照你 pww_maps 的寫法：prompts[1:] 對應 layouts 的 seg_cls 通道 0..seg_cls-1）
+        # #     #    若 seg_cls 比 prompts[1:] 多，超出的通道會用 "cls{idx}" 當作預設標籤。
+        # #     ch2label = {}
+        # #     max_bind = min(seg_cls, len(prompts) - 1)
+        # #     for s in range(seg_cls):
+        # #         if s < max_bind:
+        # #             ch2label[s] = str(prompts[s + 1])
+        # #         else:
+        # #             ch2label[s] = f"cls{s}"
+
+        # #     # 2) 一些顏色（BGR），夠用就好，不夠會輪流使用
+        # #     color_table = [
+        # #         (0, 160, 255),   # 橘
+        # #         (0, 220, 0),     # 綠
+        # #         (255, 64, 64),   # 藍->(BGR 這其實偏紅，下面再來個紫/青)
+        # #         (200, 0, 200),   # 紫
+        # #         (200, 200, 0),   # 青
+        # #         (0, 100, 255),   # 深橘
+        # #         (180, 180, 180), # 灰
+        # #         (0, 255, 255),   # 黃
+        # #     ]
+
+        # #     # 3) 視訊輸出器
+        # #     fps = max(4, min(30, clip_length if isinstance(clip_length, int) and clip_length > 0 else 8))
+        # #     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        # #     writer = cv2.VideoWriter(out_mp4_path, fourcc, fps, (width, height))
+
+        # #     # 4) 逐幀畫圖
+        # #     alpha = 0.45   # mask 疊加透明度
+        # #     txt_scale = max(0.4, min(1.2, width / 1024.0))   # 依輸出尺寸調整字體大小
+        # #     txt_thick = 1
+
+        # #     with torch.no_grad():
+        # #         for f in range(frames):
+        # #             # 底圖
+        # #             canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        # #             canvas[:] = (10, 10, 10)
+
+        # #             # 角落資訊（縮小、不干擾中間）
+        # #             info = f"frame {f:03d}/{frames-1:03d}"
+        # #             cv2.putText(canvas, info, (12, 24),
+        # #                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+
+        # #             for s in range(seg_cls):
+        # #                 m = layouts[f, s, 0]
+        # #                 m_np = (m.detach().float().cpu().numpy() > 0.5).astype(np.uint8)
+        # #                 if m_np.sum() == 0:
+        # #                     continue
+
+        # #                 # 顏色 & 疊加
+        # #                 color = color_table[s % len(color_table)]
+        # #                 overlay = canvas.copy()
+        # #                 overlay[m_np.astype(bool)] = color
+        # #                 canvas = cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0)
+
+        # #                 # 找最大輪廓 → 外接框
+        # #                 cnts, _ = cv2.findContours(m_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # #                 if len(cnts) == 0:
+        # #                     continue
+        # #                 cnt = max(cnts, key=cv2.contourArea)
+        # #                 x, y, w, h = cv2.boundingRect(cnt)
+
+        # #                 # 畫輪廓
+        # #                 cv2.drawContours(canvas, [cnt], -1, color, 2)
+
+        # #                 # 準備標籤
+        # #                 label = ch2label.get(s, f"cls{s}")
+
+        # #                 # 以 scale=1 估基準文字尺寸
+        # #                 (tw0, th0), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+        # #                 if tw0 == 0 or th0 == 0:
+        # #                     continue
+
+        # #                 # 自適應縮放：讓文字落在 bbox 的 70% 範圍內
+        # #                 LABEL_SCALE_BOOST = 0.3   # 整體縮小字體，原本 1.0 → 改 0.7
+        # #                 MIN_SCALE = 0.25          # 原本 0.35 → 改 0.25
+        # #                 MAX_SCALE = 1.8           # 原本 2.0 → 改 1.8
+        # #                 TARGET_RATIO = 0.60       # 原本 0.85 → 改 0.60，文字佔 bbox 面積更小
+        # #                 target_ratio = TARGET_RATIO
+        # #                 scale_w = (w * target_ratio) / max(1, tw0)
+        # #                 scale_h = (h * target_ratio) / max(1, th0)
+        # #                 scale = min(scale_w, scale_h) * LABEL_SCALE_BOOST
+        # #                 scale = max(MIN_SCALE, min(MAX_SCALE, scale))
+        # #                 thickness = max(1, int(round(2 * scale)))
+
+        # #                 # 以縮放後尺寸重新取得寬高
+        # #                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+
+        # #                 # 預設：把文字放在 bbox 內置中（靠上些）
+        # #                 pad = max(2, int(4 * scale))
+        # #                 tx = int(x + (w - tw) / 2)
+        # #                 ty = int(y + (h + th) / 2)  # baseline
+        # #                 # 嘗試避免超框：若 bbox 太小或文字高度接近 bbox，改放到 bbox 上方並加指示線
+        # #                 place_outside = False
+        # #                 if tw > w * 0.98 or th > h * 0.90:
+        # #                     place_outside = True
+
+        # #                 if not place_outside:
+        # #                     # 畫底框提高可讀性
+        # #                     bx0, by0 = max(0, tx - pad), max(0, ty - th - pad)
+        # #                     bx1, by1 = min(width - 1, tx + tw + pad), min(height - 1, ty + pad)
+        # #                     cv2.rectangle(canvas, (bx0, by0), (bx1, by1), (0, 0, 0), -1)
+        # #                     cv2.putText(canvas, label, (tx, ty),
+        # #                                 cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        # #                 else:
+        # #                     # 放到 bbox 上方中線，並拉一條線指回 bbox
+        # #                     out_ty = max(10, y - 8)  # 文字 baseline
+        # #                     out_tx = int(x + (w - tw) / 2)
+        # #                     bx0, by0 = max(0, out_tx - pad), max(0, out_ty - th - pad)
+        # #                     bx1, by1 = min(width - 1, out_tx + tw + pad), min(height - 1, out_ty + pad)
+        # #                     cv2.rectangle(canvas, (bx0, by0), (bx1, by1), (0, 0, 0), -1)
+        # #                     cv2.putText(canvas, label, (out_tx, out_ty),
+        # #                                 cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        # #                     # 指示線：從外框中心指到 bbox 重心
+        # #                     M = cv2.moments(m_np)
+        # #                     if M["m00"] > 1e-6:
+        # #                         cx = int(M["m10"] / M["m00"])
+        # #                         cy = int(M["m01"] / M["m00"])
+        # #                     else:
+        # #                         ys, xs = np.where(m_np > 0)
+        # #                         cx, cy = (int(xs.mean()), int(ys.mean())) if xs.size > 0 else (x + w // 2, y + h // 2)
+        # #                     line_y = int((by0 + by1) / 2)
+        # #                     line_x = int((bx0 + bx1) / 2)
+        # #                     cv2.line(canvas, (line_x, line_y), (cx, cy), (0, 0, 0), max(1, thickness - 1))
+        # #                     cv2.line(canvas, (line_x, line_y), (cx, cy), (255, 255, 255), 1)
+
+        # #             # 存檔與寫影格
+        # #             png_path = os.path.join(out_png_dir, f"{f:04d}.png")
+        # #             cv2.imwrite(png_path, canvas)
+        # #             writer.write(canvas)
+
+        # #     writer.release()
+        # #     print(f"[Mask-Prompt 可視化] 單幀輸出：{out_png_dir}")
+        # #     print(f"[Mask-Prompt 可視化] MP4 影片：{out_mp4_path}")
+
+        # # except Exception as e:
+        # #     print(f"[Mask-Prompt 可視化] 產生失敗：{e}")
+        # # ========= 【新增】區塊結束 =========
+        # # import sys
+        # # sys.exit()
+        # return text_cond, sreg_maps, creg_maps, reg_sizes, reg_sizes_c, id_maps
+
+
 
     def __call__(
         self,
@@ -696,6 +1365,10 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         image: Union[torch.FloatTensor, PIL.Image.Image] = None,
         latent_mask: Union[torch.FloatTensor, PIL.Image.Image] = None,
         layouts: Union[torch.FloatTensor, PIL.Image.Image] = None,
+        dirty_A: list = None,
+        dirty_B: list = None,
+        clean_A: list = None,
+        clean_B: list = None,
         latent_part_mask: Union[torch.FloatTensor, PIL.Image.Image] = None,
         part_layouts: Union[torch.FloatTensor, PIL.Image.Image] = None,
         blending_percentage: float=0.25,
@@ -746,26 +1419,26 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         
         if latents is None:
-            # cache_path = "./inversion_cache/inversion_latents.pt"
+            cache_path = "./inversion_cache/inversion_latents.pt"
             
-            # if os.path.exists(cache_path):
-            #     print(f"✅ Found cached inversion latents at {cache_path}")
-            #     data = torch.load(cache_path, map_location="cuda")   # 自動放回 GPU
-            #     latents = data["latents"]
-            #     attn_inversion_dict = data["attn_inversion_dict"]
-            # else:
-            #     os.makedirs(cache_path, exist_ok=True)
-            latents, attn_inversion_dict = self.prepare_latents_ddim_inverted(
-                image, batch_size, source_prompt,
-                do_classifier_free_guidance, generator,
-                control, controlnet_conditioning_scale, use_pnp, cluster_inversion_feature
-            )
-                # print("use inversion latents")
+            if os.path.exists(cache_path):
+                print(f"✅ Found cached inversion latents at {cache_path}")
+                data = torch.load(cache_path, map_location="cuda")   # 自動放回 GPU
+                latents = data["latents"]
+                attn_inversion_dict = data["attn_inversion_dict"]
+            else:
+                os.makedirs(cache_path, exist_ok=True)
+                latents, attn_inversion_dict = self.prepare_latents_ddim_inverted(
+                    image, batch_size, source_prompt,
+                    do_classifier_free_guidance, generator,
+                    control, controlnet_conditioning_scale, use_pnp, cluster_inversion_feature
+                )
+                print("use inversion latents")
             
-                # torch.save({
-                #     "latents": latents.cpu(),
-                #     "attn_inversion_dict": attn_inversion_dict
-                # }, cache_path)
+                torch.save({
+                    "latents": latents.cpu(),
+                    "attn_inversion_dict": attn_inversion_dict
+                }, cache_path)
         ## prepare text embedding, self attention map, cross attention map
         _, _, _, downsample_height, downsample_width = latents.shape
         attention_type = self._get_attention_type()
@@ -777,7 +1450,6 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
 
         #============do visualization for st-layout attn===============#
         self.store_controller = attention_util.AttentionStore()
-        print(f"====attn:{attention_type}")
         editor = ST_Layout_Attn_ControlEdit(text_cond=text_cond,sreg_maps=sreg_maps,creg_maps=creg_maps,reg_sizes=reg_sizes,reg_sizes_c=reg_sizes_c,
                                                 time_steps=time_steps,clip_length=clip_length,attention_type=attention_type,
                                                 additional_attention_store=self.store_controller,
@@ -795,7 +1467,9 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         else:
             print("sreg_map is not none")
         # attention_util.register_attention_control(self, editor, text_cond, clip_length, downsample_height,downsample_width,ddim_inversion=False, id_masks_by_res=id_masks_by_res)
-        attention_util.register_attention_control(self, editor, text_cond, clip_length, downsample_height,downsample_width,ddim_inversion=False, id_masks_by_res=id_masks_by_res)
+
+        print()
+        attention_util.register_attention_control(self, editor, text_cond, clip_length, downsample_height,downsample_width,ddim_inversion=False, id_masks_by_res=id_masks_by_res, dirty_A=dirty_A, dirty_B=dirty_B, clean_A=clean_A, clean_B=clean_B)
         #============do visualization for st-layout attn===============#
 
         # editor = ST_Layout_Attn_Control(text_cond=text_cond,sreg_maps=sreg_maps,creg_maps=creg_maps,reg_sizes=reg_sizes,reg_sizes_c=reg_sizes_c,
@@ -888,106 +1562,113 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
 
                     latents = latents * latent_mask + noise_source_latents * (1 - latent_mask)
 ##########################################################################################################
-                    #                 # === 參數 ===
-                    # make_step_videos = False       # 是否每 5 步輸出影片
-                    # video_every = 5               # 每幾步輸出一次影片（50 步 → 每 5 步 1 支 → 共 10 支）
-                    # video_fps = 12                # 影片幀率
-                    # save_only_first_batch = True  # 只輸出 batch=0
+                                    # === 參數 ===
+                    make_step_videos = False       # 是否每 5 步輸出影片
+                    video_every = 5               # 每幾步輸出一次影片（50 步 → 每 5 步 1 支 → 共 10 支）
+                    video_fps = 12                # 影片幀率
+                    save_only_first_batch = True  # 只輸出 batch=0
                     
-                    # # === 輸出資料夾（用 timestamp 避免覆蓋）===
-                    # run_tag = time.strftime("%Y%m%d-%H%M%S")
-                    # video_dir = os.path.join(logdir, f"denoise_videos")
-                    # os.makedirs(video_dir, exist_ok=True)
+                    # === 輸出資料夾（用 timestamp 避免覆蓋）===
+                    run_tag = time.strftime("%Y%m%d-%H%M%S")
+                    video_dir = os.path.join(logdir, f"denoise_videos")
+                    os.makedirs(video_dir, exist_ok=True)
                     
-                    # def _save_mp4(frames_np, out_path, fps=12):
-                    #     """
-                    #     frames_np: [T, H, W, C]，數值 0~1 或 0~255
-                    #     會自動轉成 uint8 再寫入 H.264 MP4
-                    #     """
-                    #     assert frames_np.ndim == 4 and frames_np.shape[-1] in (1, 3), f"unexpected: {frames_np.shape}"
-                    #     arr = frames_np
-                    #     if arr.dtype != np.uint8:
-                    #         arr = np.clip(arr, 0.0, 1.0) * 255.0
-                    #         arr = arr.astype(np.uint8)
-                    #     # 若是單通道，轉成 3 通道方便寫入
-                    #     if arr.shape[-1] == 1:
-                    #         arr = np.repeat(arr, 3, axis=-1)
-                    #     writer = imageio.get_writer(out_path, fps=fps, codec='libx264', quality=8)
-                    #     for f in range(arr.shape[0]):
-                    #         writer.append_data(arr[f])
-                    #     writer.close()
-                    #     # 取 VAE/UNet 的 dtype / device（可在迴圈外先算好）
-                    # # 取 VAE 的 dtype/device（放到循環外更好）
-                    # vae_device = next(self.vae.parameters()).device
-                    # vae_dtype  = next(self.vae.parameters()).dtype  # 常見 torch.float16
+                    def _save_mp4(frames_np, out_path, fps=12):
+                        """
+                        frames_np: [T, H, W, C]，數值 0~1 或 0~255
+                        會自動轉成 uint8 再寫入 H.264 MP4
+                        """
+                        assert frames_np.ndim == 4 and frames_np.shape[-1] in (1, 3), f"unexpected: {frames_np.shape}"
+                        arr = frames_np
+                        if arr.dtype != np.uint8:
+                            arr = np.clip(arr, 0.0, 1.0) * 255.0
+                            arr = arr.astype(np.uint8)
+                        # 若是單通道，轉成 3 通道方便寫入
+                        if arr.shape[-1] == 1:
+                            arr = np.repeat(arr, 3, axis=-1)
+                        writer = imageio.get_writer(out_path, fps=fps, codec='libx264', quality=8)
+                        for f in range(arr.shape[0]):
+                            writer.append_data(arr[f])
+                        writer.close()
+                        # 取 VAE/UNet 的 dtype / device（可在迴圈外先算好）
+                    # 取 VAE 的 dtype/device（放到循環外更好）
+                    vae_device = next(self.vae.parameters()).device
+                    vae_dtype  = next(self.vae.parameters()).dtype  # 常見 torch.float16
                     
-                    # # 若你的 diffusers 版本支援，開啟 VAE slicing/tiling（放循環外執行一次）
-                    # try:
-                    #     if hasattr(self.vae, "enable_slicing"): self.vae.enable_slicing()
-                    #     if hasattr(self.vae, "enable_tiling"):  self.vae.enable_tiling()
-                    # except Exception:
-                    #     pass
+                    # 若你的 diffusers 版本支援，開啟 VAE slicing/tiling（放循環外執行一次）
+                    try:
+                        if hasattr(self.vae, "enable_slicing"): self.vae.enable_slicing()
+                        if hasattr(self.vae, "enable_tiling"):  self.vae.enable_tiling()
+                    except Exception:
+                        pass
                     
-                    # # =====================  插入：每 5 步輸出 1 支影片（串流小塊解碼）  =====================
-                    # if make_step_videos and (video_every > 0) and ((i % video_every) == 0):
-                    #     import imageio.v2 as imageio
-                    #     import numpy as np
-                    #     from torch.cuda.amp import autocast
+                    # =====================  插入：每 5 步輸出 1 支影片（串流小塊解碼）  =====================
+                    if make_step_videos and (video_every > 0) and ((i % video_every) == 0):
+                        import imageio.v2 as imageio
+                        import numpy as np
+                        from torch.cuda.amp import autocast
                     
-                    #     with torch.inference_mode():
-                    #         latents_vis = latents[:1] if save_only_first_batch else latents     # [B,C,T,H,W]
-                    #         B, C, T, H, W = latents_vis.shape
-                    #         step_abs = int(len(time_steps) * blending_percentage) + i
-                    #         out_path = os.path.join(video_dir, f"video_step_{step_abs:04d}_b0.mp4")
+                        with torch.inference_mode():
+                            latents_vis = latents[:1] if save_only_first_batch else latents     # [B,C,T,H,W]
+                            B, C, T, H, W = latents_vis.shape
+                            step_abs = int(len(time_steps) * blending_percentage) + i
+                            out_path = os.path.join(video_dir, f"video_step_{step_abs:04d}_b0.mp4")
                     
-                    #         # 串流寫 MP4，不把整段影片放在 GPU/CPU 記憶體
-                    #         writer = imageio.get_writer(out_path, fps=video_fps, codec='libx264', quality=8)
+                            # 串流寫 MP4，不把整段影片放在 GPU/CPU 記憶體
+                            writer = imageio.get_writer(out_path, fps=video_fps, codec='libx264', quality=8)
                     
-                    #         # 重要：按時間維分塊（例如每次解 4 幀），你可依 GPU 改 t_chunk=1/2/4/8
-                    #         t_chunk = 4
+                            # 重要：按時間維分塊（例如每次解 4 幀），你可依 GPU 改 t_chunk=1/2/4/8
+                            t_chunk = 4
                     
-                    #         for t0 in range(0, T, t_chunk):
-                    #             t1 = min(T, t0 + t_chunk)
-                    #             # 取 [B,C,tt,H,W] → [B*tt,C,H,W]
-                    #             x = latents_vis[:, :, t0:t1].contiguous()
-                    #             Btt = x.shape[0] * x.shape[2]
-                    #             x = x.permute(0, 2, 1, 3, 4).reshape(Btt, C, H, W)
-                    #             x = x.detach().to(device=vae_device, dtype=vae_dtype)
+                            for t0 in range(0, T, t_chunk):
+                                t1 = min(T, t0 + t_chunk)
+                                # 取 [B,C,tt,H,W] → [B*tt,C,H,W]
+                                x = latents_vis[:, :, t0:t1].contiguous()
+                                Btt = x.shape[0] * x.shape[2]
+                                x = x.permute(0, 2, 1, 3, 4).reshape(Btt, C, H, W)
+                                x = x.detach().to(device=vae_device, dtype=vae_dtype)
                     
-                    #             # 在 VAE 精度下跑（舊版 torch 用 autocast(dtype=...)）
-                    #             try:
-                    #                 ctx = autocast(dtype=(torch.float16 if vae_dtype == torch.float16 else torch.bfloat16))
-                    #             except TypeError:
-                    #                 # 更舊版 torch 沒有 dtype 參數，直接關掉 AMP
-                    #                 class _Dummy:
-                    #                     def __enter__(self): pass
-                    #                     def __exit__(self, *a): pass
-                    #                 ctx = _Dummy()
+                                # 在 VAE 精度下跑（舊版 torch 用 autocast(dtype=...)）
+                                try:
+                                    ctx = autocast(dtype=(torch.float16 if vae_dtype == torch.float16 else torch.bfloat16))
+                                except TypeError:
+                                    # 更舊版 torch 沒有 dtype 參數，直接關掉 AMP
+                                    class _Dummy:
+                                        def __enter__(self): pass
+                                        def __exit__(self, *a): pass
+                                    ctx = _Dummy()
                     
-                    #             with ctx:
-                    #                 # 直接走 VAE.decode（不經你原本的 decode_latents 一次吃爆）
-                    #                 # diffusers VAE 輸出區間通常 [-1,1]，後處理到 [0,1]
-                    #                 dec = self.vae.decode(x).sample  # [B*tt,3,H,W]，dtype≈vae_dtype
+                                with ctx:
+                                    # 直接走 VAE.decode（不經你原本的 decode_latents 一次吃爆）
+                                    # diffusers VAE 輸出區間通常 [-1,1]，後處理到 [0,1]
+                                    dec = self.vae.decode(x).sample  # [B*tt,3,H,W]，dtype≈vae_dtype
                     
-                    #             dec = dec.float()                    # 後處理用 fp32
-                    #             dec = (dec / 2 + 0.5).clamp(0, 1)    # [-1,1] → [0,1]
-                    #             dec = dec.permute(0, 2, 3, 1).cpu().numpy()  # [B*tt,H,W,C]
+                                dec = dec.float()                    # 後處理用 fp32
+                                dec = (dec / 2 + 0.5).clamp(0, 1)    # [-1,1] → [0,1]
+                                dec = dec.permute(0, 2, 3, 1).cpu().numpy()  # [B*tt,H,W,C]
                     
-                    #             # 只寫 batch=0 的幀（如果想全部 batch，就多一層 batch 邏輯）
-                    #             # 這裡由於我們已經把 B 合併進 B*tt，因此只需按 tt 順序寫
-                    #             for k in range(dec.shape[0]):
-                    #                 frame = (dec[k] * 255).astype(np.uint8)
-                    #                 if frame.shape[-1] == 1:
-                    #                     frame = np.repeat(frame, 3, axis=-1)
-                    #                 writer.append_data(frame)
+                                # 只寫 batch=0 的幀（如果想全部 batch，就多一層 batch 邏輯）
+                                # 這裡由於我們已經把 B 合併進 B*tt，因此只需按 tt 順序寫
+                                for k in range(dec.shape[0]):
+                                    frame = (dec[k] * 255).astype(np.uint8)
+                                    if frame.shape[-1] == 1:
+                                        frame = np.repeat(frame, 3, axis=-1)
+                                    writer.append_data(frame)
                     
-                    #             # 釋放 GPU 記憶體
-                    #             del x, dec
-                    #             torch.cuda.empty_cache()
+                                # 釋放 GPU 記憶體
+                                del x, dec
+                                torch.cuda.empty_cache()
                     
-                    #         writer.close()
-                    #         print(f"[video] saved {out_path}")
-                    # # =====================  插入結束 =====================
+                            writer.close()
+                            print(f"[video] saved {out_path}")
+                    # =====================  插入結束 =====================
+
+
+
+
+
+
+
 
                     # call the callback, if provided
                     if i == len(time_steps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):

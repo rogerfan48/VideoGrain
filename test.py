@@ -17,7 +17,7 @@ from diffusers import (
     AutoencoderKL,
     DDIMScheduler,
     DDIMInverseScheduler,
-)
+) 
 from diffusers.utils.import_utils import is_xformers_available
 from transformers import AutoTokenizer, CLIPTextModel
 from einops import rearrange
@@ -27,6 +27,7 @@ from video_diffusion.models.unet_3d_condition import UNetPseudo3DConditionModel
 from video_diffusion.data.dataset import ImageSequenceDataset
 from video_diffusion.common.util import get_time_string, get_function_args
 from video_diffusion.common.logger import get_logger_config_path
+from video_diffusion.common.cross_exam import compute_centers_and_contamination, load_instance_masks, filter_clean_frames_by_nonempty
 from video_diffusion.common.image_util import log_train_samples,log_infer_samples,save_tensor_images_and_video,visualize_check_downsample_keypoints,sample_trajectories,save_videos_grid,sample_trajectories_new, sample_trajectories_cotracker
 from video_diffusion.common.instantiate_from_config import instantiate_from_config
 from video_diffusion.pipelines.validation_loop import SampleLogger
@@ -51,6 +52,7 @@ def collate_fn(examples):
         "images": torch.stack([example["images"] for example in examples]),
         "masks": torch.cat([example["masks"] for example in examples]),
         "layouts": torch.cat([example["layouts"] for example in examples]),
+        # "mask_item": examples["mask_item"]
         # "part_masks": torch.cat([example["part_masks"] for example in examples]),
         # "part_layouts": torch.cat([example["part_layouts"] for example in examples]),  
     }
@@ -190,8 +192,9 @@ def test(
         max_length=tokenizer.model_max_length,
         return_tensors="pt",
     ).input_ids
-    video_dataset = ImageSequenceDataset(**dataset_config, prompt_ids=prompt_ids)
+    video_dataset = ImageSequenceDataset(**dataset_config, prompt_ids=prompt_ids, log_dir=logdir)
 
+    mask_item = video_dataset.layout_mask_item
     train_dataloader = torch.utils.data.DataLoader(
         video_dataset,
         batch_size=batch_size,
@@ -256,7 +259,8 @@ def test(
     ## save source video
 
     save_videos_grid(batch["images"].cpu(),os.path.join(logdir,"source_video.mp4"),rescale=True)
-
+    # import sys
+    # sys.exit()
     images = rearrange(images.to(dtype=torch.float32), "b c f h w -> (b f) h w c")
 
     control_type = control_config['control_type']
@@ -351,6 +355,96 @@ def test(
             height,
             width
         )
+
+    mask_dir = os.path.join(logdir, "masks")
+    print(mask_item)
+
+    maskA, maskB, meta = load_instance_masks(mask_dir, mask_item)
+    out = compute_centers_and_contamination(maskA, maskB)
+    kept = out["kept_indices"] 
+    A_contam_cent = np.where(out["contam_centroid_A"])[0]
+    B_contam_cent = np.where(out["contam_centroid_B"])[0]
+    A_clean_cent  = np.where(~out["contam_centroid_A"])[0]
+    B_clean_cent  = np.where(~out["contam_centroid_B"])[0]
+    A_contam_cent_T = kept[A_contam_cent].tolist()
+    B_contam_cent_T = kept[B_contam_cent].tolist()
+    A_clean_cent_T  = kept[A_clean_cent].tolist()
+    B_clean_cent_T  = kept[B_clean_cent].tolist()
+
+    out_cent = filter_clean_frames_by_nonempty(
+        S_clean=A_clean_cent_T,
+        B_clean=B_clean_cent_T,
+        maskA=maskA,
+        maskB=maskB,
+        min_ratio=0.0,  # 想更嚴格可改 0.001 (0.1%) 等
+    )
+    S_clean_final_cent = out_cent["kept_S"]
+    B_clean_final_cent = out_cent["kept_B"]
+    S_removed_cent     = out_cent["removed_S"]
+    B_removed_cent     = out_cent["removed_B"]
+    print("A 被汙染幀:", A_contam_cent_T)
+    print("A 沒被汙染幀(過濾前):", A_clean_cent_T)
+    print("A 沒被汙染幀(過濾後):", S_clean_final_cent)
+    print("B 被汙染幀:", B_contam_cent_T)
+    print("B 沒被汙染幀(過濾前):", B_clean_cent_T)
+    print("B 沒被汙染幀(過濾後):", B_clean_final_cent)
+    print("A: 去掉的(近乎全黑)", S_removed_cent)
+    print("B: 去掉的(近乎全黑)", B_removed_cent)
+    dirty_A = A_contam_cent_T
+    clean_A = S_clean_final_cent
+    dirty_B = B_contam_cent_T
+    clean_B = B_clean_final_cent
+
+
+    # 取交集
+    common_clean = list(set(clean_A) & set(clean_B))
+    
+    # 找出不在交集內的幀（要移去汙染）
+    extra_A = list(set(clean_A) - set(common_clean))
+    extra_B = list(set(clean_B) - set(common_clean))
+    
+    # 更新乾淨幀
+    clean_A_final = sorted(common_clean)
+    clean_B_final = sorted(common_clean)
+    
+    # 更新汙染幀
+    dirty_A_final = sorted(list(set(dirty_A) | set(extra_A)))
+    dirty_B_final = sorted(list(set(dirty_B) | set(extra_B)))
+    
+    print("A 最終乾淨幀:", clean_A_final)
+    print("B 最終乾淨幀:", clean_B_final)
+    print("A 最終汙染幀:", dirty_A_final)
+    print("B 最終汙染幀:", dirty_B_final)
+
+    dirty_A = dirty_A_final
+    dirty_B = dirty_B_final
+    clean_A = clean_A_final
+    clean_B = clean_B_final
+    # 假設前面已經有 logger 設定好
+    logger.info(f"A 最終乾淨幀 (clean_A_final): {clean_A}")
+    logger.info(f"B 最終乾淨幀 (clean_B_final): {clean_B}")
+    logger.info(f"A 最終汙染幀 (dirty_A_final): {dirty_A}")
+    logger.info(f"B 最終汙染幀 (dirty_B_final): {dirty_B}")
+
+    # cross_result = exam_cross(
+    #     os.path.join(logdir, "source_video.mp4"),
+    #     accelerator.device,
+    #     grid_size = cotracker_grid_size,
+    #     use_online = cotracker_online,
+    #     cotracker_device = None,
+    #     visualize_flow = visualize_cotracker_flow,
+    #     mask_log = mask_dir
+    # )
+    # print(cross_result)
+    # print(f'[A光流] 被汙染幀: {cross_result["A"]["contaminated_frames"]}')
+    # print(f'[A光流] 未汙染幀: {cross_result["A"]["clean_frames"]}')
+    # print(f'[B光流] 被汙染幀: {cross_result["B"]["contaminated_frames"]}')
+    # print(f'[B光流] 未汙染幀: {cross_result["B"]["clean_frames"]}')
+    # dirty_A = cross_result["A"]["contaminated_frames"]
+    # clean_A  = cross_result["A"]["clean_frames"]
+    # dirty_B = cross_result["B"]["contaminated_frames"]
+    # clean_B = cross_result["B"]["clean_frames"]
+        
     # compute optical flows and sample trajectories
     torch.cuda.empty_cache()
 
@@ -394,54 +488,60 @@ def test(
     print('flatten res:',editing_config['flatten_res'])
     all_start = time.time()
     ###ddim inversion scheduler end
-
     if editing_config['use_freeu']:
         from video_diffusion.prompt_attention.free_lunch_utils import apply_freeu
         apply_freeu(pipeline, b1=1.2, b2=1.5, s1=1.0, s2=1.0)
     if editing_config.get('use_invertion_latents', False):
-        # Precompute the latents for this video to align the initial latents in training and test
         logger.info("use inversion latents")
         assert batch["images"].shape[0] == 1, "Only support, overfiting on a single video"
-
-        cache_dir = "./inversion_cache"
-        cache_path = os.path.join(cache_dir, "Roger_inversion_latents.pt")
-        if os.path.exists(cache_path):
-            print(f"✅ Found cached inversion latents at {cache_path}")
-            data = torch.load(cache_path, map_location="cuda")   # 自動放回 GPU
-            latents = data["latents"]
-            attn_inversion_dict = data["attn_inversion_dict"]
-        # data = torch.load(cache_path, map_location="cpu")
-        # latents = data["latents"].to("cuda", non_blocking=True)
-        # attn_inversion_dict = {k: v.to("cuda", non_blocking=True) for k, v in data["attn_inversion_dict"].items()}
-
-            batch['ddim_init_latents'] = latents
-
-        else:     
-            os.makedirs(cache_dir, exist_ok=True)
-            latents, attn_inversion_dict = pipeline.prepare_latents_ddim_inverted(
-                image=rearrange(batch["images"].to(dtype=weight_dtype), "b c f h w -> (b f) c h w"),
-                batch_size = 1,
-                source_prompt = dataset_config.prompt,
-                do_classifier_free_guidance=True,  
-                control=batch['control'], controlnet_conditioning_scale=control_config['controlnet_conditioning_scale'], 
-                use_pnp=editing_config['use_pnp'],
-                cluster_inversion_feature=editing_config.get('cluster_inversion_feature', False),
-                trajs=trajectories,
-                old_qk=editing_config["old_qk"],
-                flatten_res=editing_config['flatten_res']
-                )
-            attn_inversion_dict_cpu = {
-                k: (v.cpu() if torch.is_tensor(v) else v)
-                for k, v in attn_inversion_dict.items()
-            }           
-            torch.save({
-                "latents": latents.cpu(),
-                "attn_inversion_dict": attn_inversion_dict
-            }, cache_path)
-
+    
+        # cache_dir = "./inversion_cache"
+        # os.makedirs(cache_dir, exist_ok=True)  # 確保目錄存在
+        # cache_path = os.path.join(cache_dir, "03Roger_inversion_latents.pt")
+    
+        # if os.path.exists(cache_path):
+        #     print(f"✅ Found cached inversion latents at {cache_path}")
+        #     data = torch.load(cache_path, map_location="cpu")
+        #     latents = data["latents"].to("cuda", non_blocking=True)
+        #     attn_inversion_dict = {
+        #         k: (v.to("cuda", non_blocking=True) if torch.is_tensor(v) else v)
+        #         for k, v in data["attn_inversion_dict"].items()
+        #     }
+        #     batch['ddim_init_latents'] = latents
+        #     # 如果後續會用到，請一併放回：
+        #     batch['attn_inversion_dict'] = attn_inversion_dict
+    
+        # else:
+        latents, attn_inversion_dict = pipeline.prepare_latents_ddim_inverted(
+            image=rearrange(batch["images"].to(dtype=weight_dtype), "b c f h w -> (b f) c h w"),
+            batch_size=1,
+            source_prompt=dataset_config.prompt,
+            do_classifier_free_guidance=True,
+            control=batch['control'],
+            controlnet_conditioning_scale=control_config['controlnet_conditioning_scale'],
+            use_pnp=editing_config['use_pnp'],
+            cluster_inversion_feature=editing_config.get('cluster_inversion_feature', False),
+            trajs=trajectories,
+            old_qk=editing_config["old_qk"],
+            flatten_res=editing_config['flatten_res'],
+        )
+    
+            # 存 CPU 版，檔案更小、通用
+            # attn_inversion_dict = attn_inversion_dict or {}  
+            # attn_inversion_dict_cpu = {
+            #     k: (v.cpu() if torch.is_tensor(v) else v)
+            #     for k, v in attn_inversion_dict.items()
+            # }
+            # torch.save({
+            #     "latents": latents.cpu(),
+            #     "attn_inversion_dict": attn_inversion_dict_cpu,  # ← 用 CPU 版
+            # }, cache_path)
+    
         batch['ddim_init_latents'] = latents
-            # print("use inversion latents")
-            # print(f"💾 Saved inversion latents to {cache_path}")
+        # 同上：若需要，順手放回
+        # batch['attn_inversion_dict'] = attn_inversion_dict
+                # print("use inversion latents")
+                # print(f"💾 Saved inversion latents to {cache_path}")
 
     else:
         batch['ddim_init_latents'] = None
@@ -475,6 +575,10 @@ def test(
                 image=images, # torch.Size([8, 3, 512, 512])
                 masks = masks,
                 layouts = layouts,
+                dirty_A = dirty_A,
+                dirty_B = dirty_B,
+                clean_A = clean_A,
+                clean_B = clean_B,
                 ### part
                 # part_masks = part_masks,
                 # part_layouts = part_layouts,
