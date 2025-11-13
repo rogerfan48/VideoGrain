@@ -210,3 +210,88 @@ class AttentionStore(AttentionControl):
         self.save_self_attention = save_self_attention
         self.latents_store = []
         self.attention_store_all_step = []
+
+
+class AttentionStoreVis(AttentionStore):
+    """
+    Enhanced AttentionStore with phase mechanism for visualization.
+    This class adds generation/inversion phase tracking without modifying the base AttentionStore behavior.
+    """
+
+    def forward(self, attn, is_cross: bool, place_in_unet: str, height=None, width=None, clip_length=None):
+        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
+
+        if attn.shape[2] <= 32 ** 2:  # 1024
+            # Store the full attention tensor (including all heads)
+            append_tensor = attn.cpu().detach()
+            self.step_store[key].append(copy.deepcopy(append_tensor))
+
+            # Only print for cross-attention to reduce noise
+            if is_cross:
+                phase_msg = f"[{self.phase.upper()}]" if hasattr(self, 'phase') else "[UNKNOWN]"
+                print(f"{phase_msg} {key}: map {len(self.step_store[key])}, shape: {attn.shape}, res: {int(attn.shape[2]**0.5)}")
+
+        return attn
+
+    def between_steps(self):
+        if self.phase == "generation":
+            self.generation_steps += 1
+            print(f"[GENERATION] Accumulating attention at step {self.generation_steps}")
+
+            # Always accumulate during generation
+            if len(self.attention_store) == 0:
+                self.attention_store = self.step_store
+            else:
+                for key in self.step_store:
+                    for i in range(len(self.step_store[key])):
+                        if key not in self.attention_store:
+                            self.attention_store[key] = []
+                        if i >= len(self.attention_store[key]):
+                            self.attention_store[key].append(self.step_store[key][i])
+                        else:
+                            self.attention_store[key][i] += self.step_store[key][i]
+        else:
+            self.inversion_steps += 1
+            print(f"[INVERSION] Step {self.inversion_steps} - not storing for visualization")
+
+        self.step_store = self.get_empty_store()
+        self.cur_step += 1
+
+    def set_phase(self, phase):
+        """Manually set the current phase (inversion or generation)"""
+        if phase in ["inversion", "generation"]:
+            print(f"[PHASE] Manually switching to {phase} phase")
+            self.phase = phase
+            if phase == "generation":
+                # Clear attention store for generation phase
+                self.attention_store = {}
+                self.generation_steps = 0
+            elif phase == "inversion":
+                self.inversion_steps = 0
+
+    def get_average_attention(self):
+        """divide the attention map value by the number of steps used for generation attention"""
+        # Use the actual number of generation steps collected
+        actual_steps_collected = max(1, self.generation_steps)
+
+        print(f"[SUMMARY] Using {actual_steps_collected} generation steps for averaging")
+        print(f"[SUMMARY] Processing {len(self.attention_store)} attention keys")
+
+        average_attention = {}
+        for key in self.attention_store:
+            average_attention[key] = []
+            if 'cross' in key:  # Only show details for cross-attention
+                print(f"[SUMMARY] {key}: {len(self.attention_store[key])} attention maps")
+            for item in self.attention_store[key]:
+                average_attention[key].append(item / actual_steps_collected)
+        return average_attention
+
+    def __init__(self, save_self_attention:bool=True, disk_store=False):
+        super(AttentionStoreVis, self).__init__(save_self_attention=save_self_attention, disk_store=disk_store)
+
+        # New: Track different phases
+        self.phase = "inversion"  # "inversion" or "generation"
+        self.inversion_steps = 0
+        self.generation_steps = 0
+        self.generation_start_step = None
+        self.use_last_n_steps = 30  # Only use last 30 steps of generation

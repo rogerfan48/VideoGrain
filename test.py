@@ -597,7 +597,8 @@ def test(
                 old_qk=editing_config["old_qk"],
                 use_pnp = editing_config['use_pnp'],
                 cluster_inversion_feature = editing_config.get('cluster_inversion_feature', False),
-                vis_cross_attn = editing_config.get('vis_cross_attn', False), 
+                vis_cross_attn = editing_config.get('vis_cross_attn', False),
+                vis_frames = editing_config.get('vis_frames', None), 
                 attn_inversion_dict = attn_inversion_dict,
             )
 

@@ -138,6 +138,7 @@ class SampleLogger:
         use_pnp = None,
         cluster_inversion_feature = None,
         vis_cross_attn = None,
+        vis_frames = None,
         attn_inversion_dict = None,
     ):
         torch.cuda.empty_cache()
@@ -208,6 +209,7 @@ class SampleLogger:
                     use_pnp=use_pnp,
                     cluster_inversion_feature= cluster_inversion_feature,
                     vis_cross_attn = vis_cross_attn,
+                    vis_frames = vis_frames,
                     attn_inversion_dict=attn_inversion_dict,
                     **{"disable_progress_bar": True} 
                 )

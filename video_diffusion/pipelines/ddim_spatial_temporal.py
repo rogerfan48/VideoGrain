@@ -25,7 +25,8 @@ from video_diffusion.prompt_attention.attention_register import register_attenti
 from video_diffusion.prompt_attention.attention_util import ST_Layout_Attn_Control,ST_Layout_Attn_ControlEdit,Attention_Record_Processor
 from video_diffusion.prompt_attention import attention_util
 from video_diffusion.prompt_attention.sd_study_utils import *
-from video_diffusion.prompt_attention.attention_store import AttentionStore
+from video_diffusion.prompt_attention.attention_store import AttentionStore, AttentionStoreVis
+from video_diffusion.prompt_attention import attention_util_vis
 from video_diffusion.common.image_util import save_gif_mp4_folder_type
 
 from PIL import Image
@@ -1395,6 +1396,7 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         use_pnp:  bool = False,
         cluster_inversion_feature: bool = False,
         vis_cross_attn: bool = False,
+        vis_frames: List[int] = None,
         attn_inversion_dict: dict=None,
         **kwargs,
     ):
@@ -1449,7 +1451,13 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         time_steps = self.scheduler.timesteps
 
         #============do visualization for st-layout attn===============#
-        self.store_controller = attention_util.AttentionStore()
+        # Use AttentionStoreVis for enhanced visualization with phase tracking
+        if vis_cross_attn:
+            self.store_controller = AttentionStoreVis()
+            self.store_controller.set_phase("generation")  # Set to generation phase for visualization
+        else:
+            self.store_controller = attention_util.AttentionStore()
+
         editor = ST_Layout_Attn_ControlEdit(text_cond=text_cond,sreg_maps=sreg_maps,creg_maps=creg_maps,reg_sizes=reg_sizes,reg_sizes_c=reg_sizes_c,
                                                 time_steps=time_steps,clip_length=clip_length,attention_type=attention_type,
                                                 additional_attention_store=self.store_controller,
@@ -1679,9 +1687,24 @@ class DDIMSpatioTemporalStableDiffusionPipeline(SpatioTemporalStableDiffusionPip
         ### vis cross attn
         # image shape fchw
         if vis_cross_attn:
+            if vis_frames is None:
+                vis_frames = [5, 10]  # Default visualization frames
+
             save_path = os.path.join(logdir,'visualization_denoise')
             os.makedirs(save_path, exist_ok=True)
-            attention_output = attention_util.show_cross_attention_plus_org_img(self.tokenizer,prompt, image, editor, 32, ["up","down"],save_path=save_path)
+
+            # Debug: Check what's in store_controller
+            print(f"[DEBUG] store_controller type: {type(self.store_controller).__name__}")
+            if hasattr(self.store_controller, 'phase'):
+                print(f"[DEBUG] store_controller phase: {self.store_controller.phase}")
+                print(f"[DEBUG] store_controller generation_steps: {self.store_controller.generation_steps}")
+            print(f"[DEBUG] store_controller attention_store keys: {list(self.store_controller.attention_store.keys())}")
+
+            # Use the new per-head visualization function
+            attention_util_vis.show_all_cross_attention_maps(
+                self.tokenizer, prompt, image, self.store_controller,
+                save_path=save_path, vis_frames=vis_frames
+            )
 
         # 8. Post-processing
         image = self.decode_latents(latents)

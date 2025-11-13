@@ -786,7 +786,13 @@ class ST_Layout_Attn_ControlEdit(AttentionStore, abc.ABC):
     
     ### original
     def forward(self, sim, is_cross: bool, place_in_unet: str, height=None, width=None, clip_length=None, **kwargs):
-        super(ST_Layout_Attn_ControlEdit, self).forward(sim, is_cross, place_in_unet,**kwargs)
+        # Always store in additional_attention_store if available
+        if self.additional_attention_store is not None:
+            self.additional_attention_store.forward(sim, is_cross, place_in_unet, height, width, clip_length)
+
+        # Call parent's forward (but not additional_attention_store version)
+        super(ST_Layout_Attn_ControlEdit, self).forward(sim, is_cross, place_in_unet, height, width, clip_length, **kwargs)
+
         assert sim is not None, "❌ Error: sim is None!"
         # 如果 sim 是 Tensor，但內含 NaN / Inf，也一併檢查
         if torch.is_tensor(sim):
@@ -984,12 +990,15 @@ class ST_Layout_Attn_ControlEdit(AttentionStore, abc.ABC):
     #     return sim
 
 
-    
     def between_steps(self):
+        # Always use additional_attention_store if available
+        if self.additional_attention_store is not None:
+            self.additional_attention_store.between_steps()
+        else:
+            super().between_steps()
 
-        super().between_steps()
         self.step_store = self.get_empty_store()
-        
+
         self.attention_position_counter_dict = {
             'down_cross': 0,
             'mid_cross': 0,
@@ -997,5 +1006,5 @@ class ST_Layout_Attn_ControlEdit(AttentionStore, abc.ABC):
             'down_self': 0,
             'mid_self': 0,
             'up_self': 0,
-        }        
-        return 
+        }
+        return

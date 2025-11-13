@@ -1,16 +1,15 @@
 pretrained_model_path: "ckpt/stable-diffusion-v1-5"
-# logdir: ./result/Roger/*final_result/result/dilated_s_f_su_b_10
-logdir: ./result/Roger/*new/02Roger_pose
+
+logdir:  ./result/cross_attn/1112_3
 dataset_config:
-  path: "data/Roger_test/data/02_walk_walk/02_walk_walk"
+  path: "data/02_walk_walk/02_walk_walk"
   prompt: "A man and a woman walking in opposite directions"
   n_sample_frame: 15
   start_sample_frame: 0
   sampling_rate: 4
-  layout_mask_dir: "data/Roger_test/data/02_walk_walk/layout_masks"
+  layout_mask_dir: "./data/02_walk_walk/layout_masks"
   layout_mask_order: ["moving_person", "standing_person"]
   layout_mask_item: ['moving_person', 'standing_person']
-  # layout_part_mask: ["moving_head", "standing_head"]
   negative_prompt: "ugly, blurry, low res, unrealistic, unaesthetic"
  
 control_config:
@@ -19,17 +18,12 @@ control_config:
   controlnet_conditioning_scale: 1.0
   hand: true
   face: false
-# control_config:
-#     control_type: "depth_zoe"
-#     pretrained_controlnet_path: ./ckpt/control_v11f1p_sd15_depth
-#     controlnet_conditioning_scale: 0.7
-
     
 editing_config:
   use_invertion_latents: true
   inject_step: 0
   old_qk: 1
-  flatten_res: [1,2,3,4,5,6,7,8,9]
+  flatten_res: [1]
   guidance_scale: 7.5
   use_pnp: false
   use_freeu: true  
@@ -44,13 +38,15 @@ editing_config:
   sample_seeds: [0]
   num_inference_steps: 50
   blending_percentage: 0
-  vis_cross_attn: True
   use_cotracker: False       # 啟用 CoTracker（false 則使用 RAFT）
   cotracker_online: false       # offline mode（更準確）
   cotracker_grid_size: null     # 自動計算 point density
   cotracker_low_memory: false   # 使用高品質模式
   cotracker_gpu_id: 1           # 在 GPU1 執行
   visualize_cotracker_flow: true 
+  vis_cross_attn: true
+  vis_frames: [2, 4, 6, 8]
+
 test_pipeline_config:
   target: video_diffusion.pipelines.ddim_spatial_temporal.DDIMSpatioTemporalStableDiffusionPipeline
   num_inference_steps: "${..validation_sample_logger.num_inference_steps}"
